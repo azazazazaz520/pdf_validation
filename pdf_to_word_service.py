@@ -198,38 +198,110 @@ class JobManager:
                 job.error = error
 
     def _process(self, job: Job) -> None:
+        task_started = time.perf_counter()
+        LOGGER.info(
+            "pdf_to_word_stage job_id=%s stage=started filename=%s page_count=%s",
+            job.job_id,
+            job.filename,
+            job.page_count,
+        )
         try:
             with self._lock:
                 job.status = "processing"
                 job.started_at = _utc_now()
                 job.progress = 5
+
+            model_started = time.perf_counter()
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=model_loading_started engine=%s",
+                job.job_id,
+                CONFIG.engine,
+            )
             pipeline = self._get_pipeline()
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=model_loading_completed elapsed_sec=%.3f",
+                job.job_id,
+                time.perf_counter() - model_started,
+            )
+
             results: list[dict[str, Any]] = []
-            for result in pipeline.predict(str(job.input_path)):
+            inference_started = time.perf_counter()
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=inference_started input=%s",
+                job.job_id,
+                job.input_path.name,
+            )
+            for result in pipeline.predict_iter(str(job.input_path)):
                 if job.cancel_event.is_set():
+                    LOGGER.info(
+                        "pdf_to_word_stage job_id=%s stage=cancelled result_count=%s",
+                        job.job_id,
+                        len(results),
+                    )
                     self._set_state(job, status="cancelled", progress=0)
                     return
                 results.append(result)
                 progress = min(80, 10 + int(70 * len(results) / max(job.page_count, 1)))
                 self._set_state(job, progress=progress)
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=inference_batch_completed result_count=%s progress=%s",
+                    job.job_id,
+                    len(results),
+                    progress,
+                )
 
             if job.cancel_event.is_set():
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=cancelled result_count=%s",
+                    job.job_id,
+                    len(results),
+                )
                 self._set_state(job, status="cancelled", progress=0)
                 return
 
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=inference_completed result_count=%s elapsed_sec=%.3f",
+                job.job_id,
+                len(results),
+                time.perf_counter() - inference_started,
+            )
             self._set_state(job, progress=90)
+            export_started = time.perf_counter()
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=docx_export_started result_count=%s",
+                job.job_id,
+                len(results),
+            )
             export_results_to_docx(
                 results,
                 job.output_path,
                 title=Path(job.filename).stem,
             )
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=docx_export_completed elapsed_sec=%.3f output_bytes=%s",
+                job.job_id,
+                time.perf_counter() - export_started,
+                job.output_path.stat().st_size,
+            )
             self._set_state(job, status="succeeded", progress=100)
         except Exception as error:
             LOGGER.exception("任务 %s 处理失败", job.job_id)
+            LOGGER.error(
+                "pdf_to_word_stage job_id=%s stage=failed elapsed_sec=%.3f error_type=%s",
+                job.job_id,
+                time.perf_counter() - task_started,
+                type(error).__name__,
+            )
             self._set_state(job, status="failed", progress=0, error=f"{type(error).__name__}: {error}")
         finally:
             with self._lock:
                 job.finished_at = _utc_now()
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=finished status=%s elapsed_sec=%.3f",
+                job.job_id,
+                job.status,
+                time.perf_counter() - task_started,
+            )
 
 
 MANAGER = JobManager()
