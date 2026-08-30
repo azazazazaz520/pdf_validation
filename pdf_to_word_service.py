@@ -21,7 +21,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pypdf import PdfReader
 
-from pdf_to_word_exporter import export_results_to_docx
+from pdf_to_word_exporter import (
+    DEFAULT_PAGE_IMAGE_JPEG_QUALITY,
+    DEFAULT_PAGE_IMAGE_MAX_PIXELS,
+    EXPORT_MODES,
+    export_results_to_docx,
+)
 from run_validation import build_pipeline
 
 
@@ -50,6 +55,13 @@ def _iso(value: datetime | None) -> str | None:
 @dataclass
 class ServiceConfig:
     engine: str = os.getenv("PDF_SERVICE_ENGINE", "structure-table-lite")
+    export_mode: str = os.getenv("PDF_SERVICE_EXPORT_MODE", "hybrid").strip().lower()
+    page_image_max_pixels: int = _env_int(
+        "PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS", DEFAULT_PAGE_IMAGE_MAX_PIXELS
+    )
+    page_image_jpeg_quality: int = _env_int(
+        "PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY", DEFAULT_PAGE_IMAGE_JPEG_QUALITY
+    )
     data_root: Path = Path(
         os.getenv("PDF_SERVICE_DATA_ROOT", str(ROOT / "service_data"))
     ).resolve()
@@ -58,6 +70,18 @@ class ServiceConfig:
     job_ttl_seconds: int = _env_int("PDF_SERVICE_JOB_TTL_SECONDS", 3600)
     cleanup_interval_seconds: int = _env_int("PDF_SERVICE_CLEANUP_INTERVAL_SECONDS", 60)
     auth_token: str = os.getenv("PDF_SERVICE_TOKEN", "")
+
+    def __post_init__(self) -> None:
+        if self.export_mode not in EXPORT_MODES:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_EXPORT_MODE 必须是 hybrid 或 text"
+            )
+        if self.page_image_max_pixels < 1:
+            raise RuntimeError("环境变量 PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS 必须大于 0")
+        if not 1 <= self.page_image_jpeg_quality <= 100:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY 必须在 1 到 100 之间"
+            )
 
 
 CONFIG = ServiceConfig()
@@ -272,10 +296,26 @@ class JobManager:
                 job.job_id,
                 len(results),
             )
+            def export_stage(stage: str, details: dict[str, Any]) -> None:
+                detail_text = " ".join(
+                    f"{key}={value}" for key, value in details.items()
+                )
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=%s%s",
+                    job.job_id,
+                    stage,
+                    f" {detail_text}" if detail_text else "",
+                )
+
             export_results_to_docx(
                 results,
                 job.output_path,
                 title=Path(job.filename).stem,
+                source_pdf=job.input_path,
+                mode=CONFIG.export_mode,
+                image_max_pixels=CONFIG.page_image_max_pixels,
+                image_jpeg_quality=CONFIG.page_image_jpeg_quality,
+                stage_callback=export_stage,
             )
             LOGGER.info(
                 "pdf_to_word_stage job_id=%s stage=docx_export_completed elapsed_sec=%.3f output_bytes=%s",
@@ -407,9 +447,11 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "engine": CONFIG.engine,
+        "export_mode": CONFIG.export_mode,
         "model_loaded": MANAGER.model_loaded(),
         "max_upload_bytes": CONFIG.max_upload_bytes,
         "max_pages": CONFIG.max_pages,
+        "page_image_max_pixels": CONFIG.page_image_max_pixels,
     }
 
 

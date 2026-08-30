@@ -5,8 +5,9 @@ import time
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
-from pdf_to_word_service import Job, JobManager
+from pdf_to_word_service import CONFIG, Job, JobManager
 
 
 class _ControlledPipeline:
@@ -50,8 +51,10 @@ class JobProcessingTest(unittest.TestCase):
             pipeline = _ControlledPipeline()
             manager._pipeline = pipeline
             worker = threading.Thread(target=manager._process, args=(job,))
+            export_mode_patch = patch.object(CONFIG, "export_mode", "text")
 
             try:
+                export_mode_patch.start()
                 worker.start()
                 self.assertTrue(pipeline.first_result_started.wait(timeout=1))
 
@@ -63,6 +66,7 @@ class JobProcessingTest(unittest.TestCase):
             finally:
                 pipeline.release_second_result.set()
                 worker.join(timeout=3)
+                export_mode_patch.stop()
                 manager.close()
 
             self.assertFalse(worker.is_alive())
