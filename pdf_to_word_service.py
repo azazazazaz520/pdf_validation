@@ -25,13 +25,16 @@ from pdf_to_word_exporter import (
     DEFAULT_PAGE_IMAGE_JPEG_QUALITY,
     DEFAULT_PAGE_IMAGE_MAX_PIXELS,
     EXPORT_MODES,
+    export_text_pages_to_docx,
     export_results_to_docx,
 )
+from pdf_routing import analyze_pdf_text
 from run_validation import build_pipeline
 
 
 ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("pdf_to_word_service")
+ROUTE_MODES = frozenset({"auto", "text", "ocr"})
 
 
 def _env_int(name: str, default: int) -> int:
@@ -42,6 +45,16 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except ValueError as error:
         raise RuntimeError(f"环境变量 {name} 必须是整数") from error
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError as error:
+        raise RuntimeError(f"环境变量 {name} 必须是数字") from error
 
 
 def _utc_now() -> datetime:
@@ -55,6 +68,9 @@ def _iso(value: datetime | None) -> str | None:
 @dataclass
 class ServiceConfig:
     engine: str = os.getenv("PDF_SERVICE_ENGINE", "structure-table-lite")
+    route_mode: str = os.getenv("PDF_SERVICE_ROUTE_MODE", "auto").strip().lower()
+    text_min_page_chars: int = _env_int("PDF_SERVICE_TEXT_MIN_PAGE_CHARS", 20)
+    text_min_page_ratio: float = _env_float("PDF_SERVICE_TEXT_MIN_PAGE_RATIO", 0.6)
     export_mode: str = os.getenv("PDF_SERVICE_EXPORT_MODE", "hybrid").strip().lower()
     page_image_max_pixels: int = _env_int(
         "PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS", DEFAULT_PAGE_IMAGE_MAX_PIXELS
@@ -72,6 +88,14 @@ class ServiceConfig:
     auth_token: str = os.getenv("PDF_SERVICE_TOKEN", "")
 
     def __post_init__(self) -> None:
+        if self.route_mode not in ROUTE_MODES:
+            raise RuntimeError("环境变量 PDF_SERVICE_ROUTE_MODE 必须是 auto、text 或 ocr")
+        if self.text_min_page_chars < 1:
+            raise RuntimeError("环境变量 PDF_SERVICE_TEXT_MIN_PAGE_CHARS 必须大于 0")
+        if not 0 < self.text_min_page_ratio <= 1:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_TEXT_MIN_PAGE_RATIO 必须大于 0 且不超过 1"
+            )
         if self.export_mode not in EXPORT_MODES:
             raise RuntimeError(
                 "环境变量 PDF_SERVICE_EXPORT_MODE 必须是 hybrid 或 text"
@@ -102,6 +126,8 @@ class Job:
     finished_at: datetime | None = None
     status: str = "queued"
     progress: int = 0
+    route: str = "pending"
+    route_reason: str | None = None
     error: str | None = None
     cancel_event: threading.Event = field(default_factory=threading.Event)
     future: Future[None] | None = None
@@ -112,6 +138,8 @@ class Job:
             "filename": self.filename,
             "status": self.status,
             "progress": self.progress,
+            "route": self.route,
+            "route_reason": self.route_reason,
             "page_count": self.page_count,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
@@ -211,6 +239,8 @@ class JobManager:
         *,
         status: str | None = None,
         progress: int | None = None,
+        route: str | None = None,
+        route_reason: str | None = None,
         error: str | None = None,
     ) -> None:
         with self._lock:
@@ -218,6 +248,10 @@ class JobManager:
                 job.status = status
             if progress is not None:
                 job.progress = progress
+            if route is not None:
+                job.route = route
+            if route_reason is not None:
+                job.route_reason = route_reason
             if error is not None:
                 job.error = error
 
@@ -234,6 +268,103 @@ class JobManager:
                 job.status = "processing"
                 job.started_at = _utc_now()
                 job.progress = 5
+
+            analysis: Any | None = None
+            route = "ocr"
+            route_reason = "forced_ocr"
+            if CONFIG.route_mode != "ocr":
+                analysis_started = time.perf_counter()
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=text_analysis_started",
+                    job.job_id,
+                )
+                try:
+                    analysis = analyze_pdf_text(
+                        job.input_path,
+                        min_page_chars=CONFIG.text_min_page_chars,
+                    )
+                    has_text_layer = analysis.has_usable_text_layer(
+                        min_page_chars=CONFIG.text_min_page_chars,
+                        min_page_ratio=CONFIG.text_min_page_ratio,
+                    )
+                    LOGGER.info(
+                        "pdf_to_word_stage job_id=%s stage=text_analysis_completed elapsed_sec=%.3f usable_page_count=%s page_count=%s text_char_count=%s usable_page_ratio=%.3f has_text_layer=%s",
+                        job.job_id,
+                        time.perf_counter() - analysis_started,
+                        analysis.usable_page_count,
+                        analysis.page_count,
+                        analysis.text_char_count,
+                        analysis.usable_page_ratio,
+                        has_text_layer,
+                    )
+                    if CONFIG.route_mode == "text":
+                        if not has_text_layer:
+                            raise RuntimeError("PDF 不满足文本层快速路线的检测阈值")
+                        route = "text"
+                        route_reason = "forced_text"
+                    elif has_text_layer:
+                        route = "text"
+                        route_reason = "text_layer_detected"
+                    else:
+                        route_reason = "text_layer_not_usable"
+                except Exception:
+                    if CONFIG.route_mode == "text":
+                        raise
+                    LOGGER.exception(
+                        "pdf_to_word_stage job_id=%s stage=text_analysis_failed fallback=ocr",
+                        job.job_id,
+                    )
+                    analysis = None
+                    route_reason = "text_analysis_failed"
+
+            self._set_state(
+                job,
+                route=route,
+                route_reason=route_reason,
+                progress=15,
+            )
+            LOGGER.info(
+                "pdf_to_word_stage job_id=%s stage=route_selected route=%s reason=%s",
+                job.job_id,
+                route,
+                route_reason,
+            )
+
+            def export_stage(stage: str, details: dict[str, Any]) -> None:
+                detail_text = " ".join(
+                    f"{key}={value}" for key, value in details.items()
+                )
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=%s%s",
+                    job.job_id,
+                    stage,
+                    f" {detail_text}" if detail_text else "",
+                )
+
+            if route == "text":
+                if analysis is None:
+                    raise RuntimeError("文本层快速路线缺少分析结果")
+                self._set_state(job, progress=60)
+                export_started = time.perf_counter()
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=docx_export_started route=text page_count=%s",
+                    job.job_id,
+                    analysis.page_count,
+                )
+                export_text_pages_to_docx(
+                    analysis.page_texts,
+                    job.output_path,
+                    title=Path(job.filename).stem,
+                    stage_callback=export_stage,
+                )
+                LOGGER.info(
+                    "pdf_to_word_stage job_id=%s stage=docx_export_completed route=text elapsed_sec=%.3f output_bytes=%s",
+                    job.job_id,
+                    time.perf_counter() - export_started,
+                    job.output_path.stat().st_size,
+                )
+                self._set_state(job, status="succeeded", progress=100)
+                return
 
             model_started = time.perf_counter()
             LOGGER.info(
@@ -292,21 +423,10 @@ class JobManager:
             self._set_state(job, progress=90)
             export_started = time.perf_counter()
             LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=docx_export_started result_count=%s",
+                "pdf_to_word_stage job_id=%s stage=docx_export_started route=ocr result_count=%s",
                 job.job_id,
                 len(results),
             )
-            def export_stage(stage: str, details: dict[str, Any]) -> None:
-                detail_text = " ".join(
-                    f"{key}={value}" for key, value in details.items()
-                )
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=%s%s",
-                    job.job_id,
-                    stage,
-                    f" {detail_text}" if detail_text else "",
-                )
-
             export_results_to_docx(
                 results,
                 job.output_path,
@@ -318,7 +438,7 @@ class JobManager:
                 stage_callback=export_stage,
             )
             LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=docx_export_completed elapsed_sec=%.3f output_bytes=%s",
+                "pdf_to_word_stage job_id=%s stage=docx_export_completed route=ocr elapsed_sec=%.3f output_bytes=%s",
                 job.job_id,
                 time.perf_counter() - export_started,
                 job.output_path.stat().st_size,
@@ -447,6 +567,9 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "engine": CONFIG.engine,
+        "route_mode": CONFIG.route_mode,
+        "text_min_page_chars": CONFIG.text_min_page_chars,
+        "text_min_page_ratio": CONFIG.text_min_page_ratio,
         "export_mode": CONFIG.export_mode,
         "model_loaded": MANAGER.model_loaded(),
         "max_upload_bytes": CONFIG.max_upload_bytes,

@@ -380,6 +380,36 @@ def _add_ocr_pages(document: Document, result_list: list[Any]) -> None:
             _add_block(document, block)
 
 
+def _add_text_pages(document: Document, page_texts: Iterable[str]) -> int:
+    page_count = 0
+    for page_index, text in enumerate(page_texts):
+        if page_index > 0:
+            document.add_page_break()
+        _add_content_lines(document, text, "text")
+        page_count += 1
+    return page_count
+
+
+def export_text_pages_to_docx(
+    page_texts: Iterable[str],
+    output_path: Path,
+    title: str,
+    *,
+    stage_callback: StageCallback | None = None,
+) -> None:
+    """将 PDF 文本层逐页导出为可编辑 DOCX。"""
+    document = Document()
+    _set_document_styles(document)
+    document.core_properties.title = title
+    text_pages = list(page_texts)
+    _notify_stage(stage_callback, "text_export_started", page_count=len(text_pages))
+    page_count = _add_text_pages(document, text_pages)
+    _notify_stage(stage_callback, "text_export_pages_completed", page_count=page_count)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    document.save(output_path)
+    _notify_stage(stage_callback, "text_export_completed", page_count=page_count)
+
+
 def export_results_to_docx(
     results: Iterable[Any],
     output_path: Path,

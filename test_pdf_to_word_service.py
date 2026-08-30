@@ -52,9 +52,11 @@ class JobProcessingTest(unittest.TestCase):
             manager._pipeline = pipeline
             worker = threading.Thread(target=manager._process, args=(job,))
             export_mode_patch = patch.object(CONFIG, "export_mode", "text")
+            route_mode_patch = patch.object(CONFIG, "route_mode", "ocr")
 
             try:
                 export_mode_patch.start()
+                route_mode_patch.start()
                 worker.start()
                 self.assertTrue(pipeline.first_result_started.wait(timeout=1))
 
@@ -67,6 +69,7 @@ class JobProcessingTest(unittest.TestCase):
                 pipeline.release_second_result.set()
                 worker.join(timeout=3)
                 export_mode_patch.stop()
+                route_mode_patch.stop()
                 manager.close()
 
             self.assertFalse(worker.is_alive())
