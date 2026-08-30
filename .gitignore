@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.py[cod]
+
+model_cache/
+service_data/
+outputs/
+qa/
+
+*.upload
+.env
+.env.*
+!.env.example
