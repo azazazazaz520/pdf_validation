@@ -17,6 +17,7 @@ _JOB_COLUMNS = (
     "stage_log_path",
     "cancel_path",
     "page_count",
+    "table_count",
     "created_at",
     "started_at",
     "finished_at",
@@ -75,6 +76,7 @@ class JobStore:
                     stage_log_path TEXT NOT NULL,
                     cancel_path TEXT NOT NULL,
                     page_count INTEGER NOT NULL,
+                    table_count INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     started_at TEXT,
                     finished_at TEXT,
@@ -89,6 +91,14 @@ class JobStore:
                 )
                 """
             )
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(jobs)").fetchall()
+            }
+            if "table_count" not in columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN table_count INTEGER NOT NULL DEFAULT 0"
+                )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_jobs_status_created "
                 "ON jobs(status, created_at)"

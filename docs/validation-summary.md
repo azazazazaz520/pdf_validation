@@ -24,7 +24,7 @@
 
 ## 第一版服务器服务
 
-服务文件：`D:\pdf_validation\pdf_to_word_service.py`
+服务文件：`D:\pdf_validation\src\pdf_to_word_service.py`
 
 端到端验证使用 `structure-table-lite` 处理 `C:\Users\Lenovo\Desktop\日报-2026-08-17.pdf`，结果如下：
 
@@ -56,14 +56,14 @@
 
 ## 产物索引
 
-- 轻量文本报告：`outputs\structure-lite_20260830_152338\report.json`
-- 表格报告：`outputs\structure-table-lite_20260830_152228\report.json`
-- VL 两页合并报告：`outputs\vl_20260830_153400\report.json`
-- VL 两页 DOCX：`outputs\vl_20260830_153400\word\synthetic_text_table.docx`
-- 真实日报 VL 报告：`outputs\vl_20260830_170021\report.json`
-- 真实日报 VL DOCX：`outputs\vl_20260830_170021\word\日报-2026-08-17.docx`
-- 第一版服务日报 DOCX：`outputs\service-e2e\daily.docx`
-- 第一版服务表格 DOCX：`outputs\service-e2e\synthetic_table.docx`
+- 轻量文本报告：`artifacts\outputs\structure-lite_20260830_152338\report.json`
+- 表格报告：`artifacts\outputs\structure-table-lite_20260830_152228\report.json`
+- VL 两页合并报告：`artifacts\outputs\vl_20260830_153400\report.json`
+- VL 两页 DOCX：`artifacts\outputs\vl_20260830_153400\word\synthetic_text_table.docx`
+- 真实日报 VL 报告：`artifacts\outputs\vl_20260830_170021\report.json`
+- 真实日报 VL DOCX：`artifacts\outputs\vl_20260830_170021\word\日报-2026-08-17.docx`
+- 第一版服务日报 DOCX：`artifacts\outputs\service-e2e\daily.docx`
+- 第一版服务表格 DOCX：`artifacts\outputs\service-e2e\synthetic_table.docx`
 
 ## 结论与下一步
 

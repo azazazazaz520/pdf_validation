@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-import pdf_worker
+import src.pdf_worker as pdf_worker
 
 
 class _SlowPipeline:

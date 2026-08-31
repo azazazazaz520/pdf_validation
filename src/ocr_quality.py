@@ -3,7 +3,7 @@ from __future__ import annotations
 import unicodedata
 from typing import Any
 
-from pdf_routing import count_text_characters, normalize_page_text
+from .pdf_routing import count_text_characters, normalize_page_text
 
 
 DEFAULT_LOW_CONFIDENCE_THRESHOLD = 0.75

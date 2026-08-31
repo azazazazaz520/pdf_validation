@@ -23,16 +23,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pypdf import PdfReader
 
-from pdf_to_word_exporter import (
+from .pdf_to_word_exporter import (
     DEFAULT_PAGE_IMAGE_JPEG_QUALITY,
     DEFAULT_PAGE_IMAGE_MAX_PIXELS,
     EXPORT_MODES,
 )
-from pdf_worker import process_job
-from job_store import JobStore
+from .pdf_worker import process_job
+from .job_store import JobStore
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 LOGGER = logging.getLogger("pdf_to_word_service")
 ROUTE_MODES = frozenset({"auto", "text", "ocr"})
 TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "timed_out"})
@@ -180,6 +180,7 @@ class Job:
     progress: int = 0
     route: str = "pending"
     route_reason: str | None = None
+    table_count: int = 0
     worker_pid: int | None = None
     error: str | None = None
     attempt: int = 0
@@ -197,6 +198,7 @@ class Job:
             "progress": self.progress,
             "route": self.route,
             "route_reason": self.route_reason,
+            "table_count": self.table_count,
             "worker_pid": self.worker_pid,
             "page_count": self.page_count,
             "created_at": _iso(self.created_at),
@@ -231,6 +233,7 @@ class Job:
             "progress": self.progress,
             "route": self.route,
             "route_reason": self.route_reason,
+            "table_count": self.table_count,
             "worker_pid": self.worker_pid,
             "error": self.error,
             "attempt": self.attempt,
@@ -314,6 +317,7 @@ class JobManager:
                 progress=int(record.get("progress") or 0),
                 route=str(record.get("route") or "pending"),
                 route_reason=record.get("route_reason"),
+                table_count=int(record.get("table_count") or 0),
                 worker_pid=(
                     int(record["worker_pid"])
                     if record.get("worker_pid") is not None
@@ -521,6 +525,7 @@ class JobManager:
             job.error = None
             job.route = "pending"
             job.route_reason = None
+            job.table_count = 0
             job.worker_reported_status = None
             job.cancel_path.unlink(missing_ok=True)
             job.output_path.unlink(missing_ok=True)
@@ -638,6 +643,7 @@ class JobManager:
                 )
                 job.route = "pending"
                 job.route_reason = None
+                job.table_count = 0
                 job.output_path.unlink(missing_ok=True)
                 self._store.save(job.as_record())
                 retry = True
@@ -649,10 +655,9 @@ class JobManager:
                 job.error = error
                 self._store.save(job.as_record())
                 retry = False
+                self._write_manager_state(job, "manager_finished", status)
         if retry:
             self._write_manager_state(job, "retry_scheduled", "queued")
-        else:
-            self._write_manager_state(job, "manager_finished", status)
 
     def _refresh_from_worker(self, job: Job) -> None:
         with self._lock:
@@ -681,6 +686,9 @@ class JobManager:
             route_reason = payload.get("route_reason")
             if isinstance(route_reason, str):
                 job.route_reason = route_reason
+            table_count = payload.get("table_count")
+            if isinstance(table_count, int) and table_count >= 0:
+                job.table_count = table_count
             worker_pid = payload.get("worker_pid")
             if isinstance(worker_pid, int):
                 job.worker_pid = worker_pid

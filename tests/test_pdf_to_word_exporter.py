@@ -11,7 +11,8 @@ from PIL import Image
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
-from pdf_to_word_exporter import (
+from src.pdf_layout import extract_pdf_layout
+from src.pdf_to_word_exporter import (
     _iter_page_images,
     _add_content_lines,
     _add_text_pages_with_sizes,
@@ -24,6 +25,63 @@ from pdf_to_word_exporter import (
 
 
 class HybridExportTest(unittest.TestCase):
+    def test_layout_export_preserves_headings_bullets_and_vector_table(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "layout.pdf"
+            docx_path = root / "layout.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(360, 300))
+            canvas.setFont("Helvetica", 16)
+            canvas.drawString(36, 270, "Layout title")
+            canvas.setFont("Helvetica", 12)
+            canvas.drawString(36, 250, "1. Scope")
+            canvas.drawString(60, 230, "First bullet.")
+            canvas.drawString(60, 212, "Second bullet.")
+            for y in (80, 110, 140, 170):
+                canvas.line(36, y, 324, y)
+            for x in (36, 180, 324):
+                canvas.line(x, 80, x, 170)
+            canvas.setFont("Helvetica", 10)
+            canvas.drawString(45, 150, "Name")
+            canvas.drawString(190, 150, "Value")
+            canvas.drawString(45, 120, "Alpha")
+            canvas.drawString(190, 120, "A")
+            canvas.drawString(45, 90, "Beta")
+            canvas.drawString(190, 90, "B")
+            canvas.save()
+
+            layout = extract_pdf_layout(pdf_path)
+            self.assertEqual(layout.table_count, 1)
+            self.assertEqual(layout.pages[0].tables[0].row_count, 3)
+            self.assertEqual(layout.pages[0].tables[0].column_count, 2)
+            self.assertEqual(layout.pages[0].tables[0].rows[0], ("Name", "Value"))
+
+            export_text_pages_to_docx(
+                ["ignored"],
+                docx_path,
+                title="layout-test",
+                source_pdf=pdf_path,
+            )
+
+            document = Document(str(docx_path))
+            headings = [
+                paragraph.text
+                for paragraph in document.paragraphs
+                if paragraph.style.name.startswith("Heading")
+            ]
+            self.assertEqual(headings[:2], ["Layout title", "1. Scope"])
+            self.assertEqual(
+                [
+                    paragraph.text
+                    for paragraph in document.paragraphs
+                    if paragraph.style.name == "List Bullet"
+                ],
+                ["First bullet.", "Second bullet."],
+            )
+            self.assertEqual(len(document.tables), 1)
+            self.assertEqual(document.tables[0].cell(2, 1).text, "B")
+
     def test_text_grouping_joins_wrapped_lines_without_extra_spaces(self) -> None:
         blocks = _group_text_lines(
             "标题\n第一行内容\n第二行内容。\n1. 第一项\n续行。",

@@ -6,6 +6,7 @@ model_cache/
 service_data/
 outputs/
 qa/
+artifacts/
 
 *.upload
 .env

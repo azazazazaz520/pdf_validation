@@ -8,7 +8,7 @@ from PIL import Image
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
-from pdf_routing import analyze_pdf_text, normalize_page_text
+from src.pdf_routing import analyze_pdf_text, normalize_page_text
 
 
 def _create_text_pdf(path: Path) -> None:

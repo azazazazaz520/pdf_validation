@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parents[1]
 os.environ.setdefault("PADDLE_PDX_CACHE_HOME", str(ROOT / "model_cache"))
 
 
@@ -24,7 +24,7 @@ def parse_args() -> argparse.Namespace:
         required=True,
     )
     parser.add_argument("--input", type=Path, default=ROOT / "fixtures" / "synthetic_text_table.pdf")
-    parser.add_argument("--output", type=Path, default=ROOT / "outputs")
+    parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "outputs")
     return parser.parse_args()
 
 

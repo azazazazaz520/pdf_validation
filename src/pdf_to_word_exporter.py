@@ -9,13 +9,22 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from docx import Document
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Inches, Pt
 from PIL import Image
 from pypdf import PdfReader
+
+from .pdf_layout import (
+    PdfDocumentLayout,
+    PdfPageLayout,
+    PdfTable,
+    PdfTextLine,
+    extract_pdf_layout,
+)
 
 
 _ORDERED_ITEM = re.compile(
@@ -27,6 +36,7 @@ _SECTION_HEADING = re.compile(
     r"^\s*(?:[一二三四五六七八九十百]+、|摘要(?:\s|$)|参考文献(?:\s|（|\(|$))"
 )
 _SUBSECTION_HEADING = re.compile(r"^\s*\d+\.\d+(?:\s|$)")
+_NUMERIC_SECTION_HEADING = re.compile(r"^\s*\d+\.(?!\d)\s+\S+")
 _FORMULA_PREFIX = re.compile(r"^\s*(?:max|min|s\.\s*t\.)(?:\s|$)", re.IGNORECASE)
 _FORMULA_SYMBOL_PREFIX = re.compile(r"^\s*[∑∏∫√∞∂∇∀∃]+")
 _LIST_ROLES = frozenset({"ordered", "bullet", "plugin"})
@@ -303,6 +313,200 @@ def _add_table(document: Document, html: str) -> None:
                 cells[index].text = value
 
 
+def _set_table_row_properties(row: Any, *, repeat_header: bool) -> None:
+    row_properties = row._tr.get_or_add_trPr()
+    cant_split = OxmlElement("w:cantSplit")
+    row_properties.append(cant_split)
+    if repeat_header:
+        table_header = OxmlElement("w:tblHeader")
+        table_header.set(qn("w:val"), "true")
+        row_properties.append(table_header)
+
+
+def _add_pdf_table(
+    document: Document,
+    pdf_table: PdfTable,
+) -> None:
+    if not pdf_table.rows or pdf_table.column_count < 1:
+        return
+    table = document.add_table(rows=0, cols=pdf_table.column_count)
+    table.style = "Table Grid"
+    table.autofit = False
+    widths = [
+        max(
+            (
+                pdf_table.column_boundaries[index + 1]
+                - pdf_table.column_boundaries[index]
+            )
+            / 72.0,
+            0.2,
+        )
+        for index in range(pdf_table.column_count)
+    ]
+    section = document.sections[-1]
+    available_width = max(
+        section.page_width.inches
+        - section.left_margin.inches
+        - section.right_margin.inches,
+        0.2,
+    )
+    scale = min(1.0, available_width / max(sum(widths), 0.2))
+    widths = [width * scale for width in widths]
+    for row_index, values in enumerate(pdf_table.rows):
+        row = table.add_row()
+        _set_table_row_properties(row, repeat_header=row_index == 0)
+        for column_index, cell in enumerate(row.cells):
+            cell.width = Inches(widths[column_index])
+            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+            cell.text = values[column_index] if column_index < len(values) else ""
+            for paragraph in cell.paragraphs:
+                paragraph.paragraph_format.space_after = Pt(0)
+                if row_index == 0:
+                    for run in paragraph.runs:
+                        run.bold = True
+    for column_index, column in enumerate(table.columns):
+        column.width = Inches(widths[column_index])
+
+
+def _line_is_in_pdf_table(
+    line: PdfTextLine,
+    pdf_table: PdfTable,
+) -> bool:
+    x0, top, x1, bottom = pdf_table.bbox
+    return (
+        x0 - 1.0 <= line.center_x <= x1 + 1.0
+        and top - 1.0 <= line.center_y <= bottom + 1.0
+    )
+
+
+def _layout_line_role(
+    line: PdfTextLine,
+    *,
+    body_left: float,
+    is_first_line: bool,
+) -> str:
+    if _SECTION_HEADING.match(line.text):
+        return "heading1"
+    if _SUBSECTION_HEADING.match(line.text):
+        return "heading2"
+    if (
+        _NUMERIC_SECTION_HEADING.match(line.text)
+        and line.x0 <= body_left + 12
+    ):
+        return "heading1"
+    if _ORDERED_ITEM.match(line.text):
+        return "ordered"
+    if re.match(r"^\s*\.\s+", line.text) and line.x0 >= body_left + 12:
+        return "ordered"
+    if _BULLET_ITEM.match(line.text):
+        return "bullet"
+    if _PLUGIN_ITEM.match(line.text):
+        return "plugin"
+    if line.x0 >= body_left + 22:
+        return "bullet"
+    if _is_formula_line(line.text):
+        return "formula"
+    if is_first_line:
+        return "title"
+    return "body"
+
+
+def _layout_lines_to_text(
+    lines: Iterable[PdfTextLine],
+    *,
+    body_left: float,
+    is_document_start: bool,
+) -> tuple[str, list[str]]:
+    prepared: list[str] = []
+    roles: list[str] = []
+    previous_role: str | None = None
+    previous_line: PdfTextLine | None = None
+    for index, line in enumerate(lines):
+        role = _layout_line_role(
+            line,
+            body_left=body_left,
+            is_first_line=is_document_start and index == 0,
+        )
+        if (
+            role == "bullet"
+            and previous_role == "ordered"
+            and previous_line is not None
+            and previous_line.text.endswith(("：", ":"))
+            and line.x0 <= previous_line.x0 + 14
+        ):
+            role = "body"
+        elif (
+            role == "bullet"
+            and previous_role == "bullet"
+            and previous_line is not None
+            and not _is_sentence_terminal(previous_line.text)
+            and not _BULLET_ITEM.match(line.text)
+        ):
+            role = "body"
+        text = line.text
+        if role == "bullet" and not _BULLET_ITEM.match(text):
+            text = f"• {text}"
+        elif role == "ordered" and re.match(r"^\s*\.\s+", text):
+            text = re.sub(r"^\s*\.\s+", "1. ", text, count=1)
+        prepared.append(text)
+        roles.append(role)
+        previous_role = role
+        previous_line = line
+    return "\n".join(prepared), roles
+
+
+def _add_layout_page_content(
+    document: Document,
+    page: PdfPageLayout,
+    *,
+    is_document_start: bool,
+    list_state: dict[str, int | None | str],
+) -> int:
+    body_left = min((line.x0 for line in page.lines), default=0.0)
+    events: list[tuple[float, int, Any]] = []
+    for table in page.tables:
+        events.append((table.bbox[1], 0, table))
+    for line in page.lines:
+        if not any(_line_is_in_pdf_table(line, table) for table in page.tables):
+            events.append((line.top, 1, line))
+    events.sort(key=lambda item: (item[0], item[1]))
+
+    text_lines: list[PdfTextLine] = []
+    table_count = 0
+    document_start_pending = is_document_start
+
+    def flush_text() -> None:
+        nonlocal document_start_pending, text_lines
+        if not text_lines:
+            return
+        content, line_roles = _layout_lines_to_text(
+            text_lines,
+            body_left=body_left,
+            is_document_start=document_start_pending,
+        )
+        for role, block_text in _group_text_lines(
+            content,
+            is_document_start=document_start_pending,
+            line_roles=line_roles,
+        ):
+            _add_editable_text_block(document, role, block_text, list_state)
+        document_start_pending = False
+        text_lines = []
+
+    for _, kind, item in events:
+        if kind == 0:
+            flush_text()
+            _add_pdf_table(document, item)
+            list_state["kind"] = None
+            list_state["num_id"] = None
+            document_start_pending = False
+            table_count += 1
+        else:
+            text_lines.append(item)
+    flush_text()
+    return table_count
+
+
 def _add_content_lines(
     document: Document,
     content: str,
@@ -338,11 +542,18 @@ def _is_formula_line(line: str) -> bool:
     )
 
 
-def _text_line_role(line: str, *, is_first_line: bool) -> str:
+def _text_line_role(
+    line: str,
+    *,
+    is_first_line: bool,
+    recognize_numeric_headings: bool = False,
+) -> str:
     if _SECTION_HEADING.match(line):
         return "heading1"
     if _SUBSECTION_HEADING.match(line):
         return "heading2"
+    if recognize_numeric_headings and _NUMERIC_SECTION_HEADING.match(line):
+        return "heading1"
     if _ORDERED_ITEM.match(line):
         return "ordered"
     if _BULLET_ITEM.match(line):
@@ -357,7 +568,7 @@ def _text_line_role(line: str, *, is_first_line: bool) -> str:
 
 
 def _is_sentence_terminal(line: str) -> bool:
-    return bool(re.search(r"[。！？!?；;：:]$", line))
+    return bool(re.search(r"[。！？!?；;：:.]$", line))
 
 
 def _needs_word_space(previous: str, current: str) -> bool:
@@ -385,6 +596,8 @@ def _group_text_lines(
     content: str,
     *,
     is_document_start: bool = False,
+    recognize_numeric_headings: bool = False,
+    line_roles: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     """将 PDF 物理换行合并为逻辑段落，并识别标题、列表和公式。"""
     lines = [line.strip() for line in content.splitlines() if line.strip()]
@@ -411,10 +624,14 @@ def _group_text_lines(
         current_lines = []
 
     for index, line in enumerate(lines):
-        role = _text_line_role(
-            line,
-            is_first_line=is_document_start and index == 0,
-        )
+        if line_roles is not None and index < len(line_roles):
+            role = line_roles[index]
+        else:
+            role = _text_line_role(
+                line,
+                is_first_line=is_document_start and index == 0,
+                recognize_numeric_headings=recognize_numeric_headings,
+            )
         if role in {"title", "heading1", "heading2", "formula"}:
             flush()
             blocks.append((role, line))
@@ -686,6 +903,47 @@ def _add_text_pages_with_sizes(
     return page_count
 
 
+def _add_layout_pages(
+    document: Document,
+    layout: PdfDocumentLayout,
+    *,
+    stage_callback: StageCallback | None = None,
+) -> tuple[int, int]:
+    _remove_initial_empty_paragraph(document)
+    list_state: dict[str, int | None | str] = {"kind": None, "num_id": None}
+    page_count = 0
+    table_count = 0
+    for page_index, page in enumerate(layout.pages):
+        if page_index > 0:
+            section = document.add_section(WD_SECTION.NEW_PAGE)
+        else:
+            section = document.sections[0]
+        width_inches = max(page.width / 72.0, 0.01)
+        height_inches = max(page.height / 72.0, 0.01)
+        _set_section_page(section, width_inches, height_inches, 0.65)
+        table_count += _add_layout_page_content(
+            document,
+            page,
+            is_document_start=page_index == 0,
+            list_state=list_state,
+        )
+        page_count += 1
+        _notify_stage(
+            stage_callback,
+            "text_layout_page_completed",
+            page=page_index + 1,
+            page_count=page_count,
+            table_count=table_count,
+        )
+    _notify_stage(
+        stage_callback,
+        "text_layout_completed",
+        page_count=page_count,
+        table_count=table_count,
+    )
+    return page_count, table_count
+
+
 def export_text_pages_to_docx(
     page_texts: Iterable[str],
     output_path: Path,
@@ -704,12 +962,48 @@ def export_text_pages_to_docx(
     document.core_properties.title = title
     text_pages = list(page_texts)
     _notify_stage(stage_callback, "text_export_started", page_count=len(text_pages))
-    page_sizes = _pdf_page_sizes(source_pdf) if source_pdf is not None else None
-    page_count = _add_text_pages_with_sizes(document, text_pages, page_sizes)
-    _notify_stage(stage_callback, "text_export_pages_completed", page_count=page_count)
+    if source_pdf is not None:
+        _notify_stage(stage_callback, "text_layout_started", page_count=len(text_pages))
+        try:
+            layout = extract_pdf_layout(source_pdf)
+        except Exception as error:
+            _notify_stage(
+                stage_callback,
+                "text_layout_fallback",
+                error=f"{type(error).__name__}: {error}",
+            )
+            page_sizes = _pdf_page_sizes(source_pdf)
+            page_count = _add_text_pages_with_sizes(document, text_pages, page_sizes)
+            table_count = 0
+        else:
+            page_count, table_count = _add_layout_pages(
+                document,
+                layout,
+                stage_callback=stage_callback,
+            )
+            if page_count != len(text_pages):
+                _notify_stage(
+                    stage_callback,
+                    "text_layout_page_count_mismatch",
+                    layout_page_count=page_count,
+                    text_page_count=len(text_pages),
+                )
+    else:
+        page_count = _add_text_pages_with_sizes(document, text_pages, None)
+        table_count = 0
+        _notify_stage(
+            stage_callback,
+            "text_export_pages_completed",
+            page_count=page_count,
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     document.save(output_path)
-    _notify_stage(stage_callback, "text_export_completed", page_count=page_count)
+    _notify_stage(
+        stage_callback,
+        "text_export_completed",
+        page_count=page_count,
+        table_count=table_count,
+    )
 
 
 def export_source_pages_to_docx(

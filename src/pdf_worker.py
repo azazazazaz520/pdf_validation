@@ -7,14 +7,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pdf_routing import analyze_pdf_text
-from ocr_quality import summarize_ocr_page
-from pdf_to_word_exporter import (
+from .pdf_routing import analyze_pdf_text
+from .ocr_quality import summarize_ocr_page
+from .pdf_to_word_exporter import (
     export_results_to_docx,
     export_source_pages_to_docx,
     export_text_pages_to_docx,
 )
-from run_validation import build_pipeline
+from .run_validation import build_pipeline
 
 
 _PIPELINES: dict[str, Any] = {}
@@ -130,10 +130,16 @@ def process_job(payload: dict[str, Any]) -> dict[str, Any]:
         _raise_if_cancelled(cancel_path)
         raise_if_timed_out(stage)
         progress = None
-        if stage in {"text_export_started", "page_images_started"}:
+        if stage in {
+            "text_export_started",
+            "text_layout_started",
+            "page_images_started",
+        }:
             progress = 60
         elif stage in {
             "text_export_pages_completed",
+            "text_layout_page_completed",
+            "text_layout_completed",
             "page_images_completed",
         }:
             progress = 90

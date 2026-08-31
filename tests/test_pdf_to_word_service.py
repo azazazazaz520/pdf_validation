@@ -9,7 +9,7 @@ from unittest.mock import patch
 from docx import Document
 from reportlab.pdfgen.canvas import Canvas
 
-import pdf_to_word_service as service
+import src.pdf_to_word_service as service
 
 
 def _create_text_pdf(path: Path) -> None:
@@ -55,12 +55,15 @@ class JobProcessingTest(unittest.TestCase):
                     self.assertEqual(current.status, "succeeded")
                     self.assertEqual(current.route, "text")
                     self.assertEqual(current.route_reason, "text_layer_complete")
+                    self.assertEqual(current.table_count, 0)
                     self.assertIsNotNone(current.worker_pid)
                     assert current.worker_pid is not None
                     self.assertGreater(current.worker_pid, 0)
                     self.assertTrue(current.output_path.is_file())
                     stage_log = current.stage_log_path.read_text(encoding="utf-8")
                     self.assertIn('"stage": "route_selected"', stage_log)
+                    self.assertIn('"stage": "text_layout_completed"', stage_log)
+                    self.assertIn('"table_count": 0', stage_log)
                     self.assertIn('"stage": "finished"', stage_log)
                     paragraphs = "\n".join(
                         paragraph.text
