@@ -1,17 +1,180 @@
 from __future__ import annotations
 
+from io import BytesIO
 import zipfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from docx import Document
+from PIL import Image
+from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
 
-from pdf_to_word_exporter import export_results_to_docx
+from pdf_to_word_exporter import (
+    _iter_page_images,
+    _add_content_lines,
+    _add_text_pages_with_sizes,
+    _group_text_lines,
+    _set_document_styles,
+    export_results_to_docx,
+    export_source_pages_to_docx,
+    export_text_pages_to_docx,
+)
 
 
 class HybridExportTest(unittest.TestCase):
+    def test_text_grouping_joins_wrapped_lines_without_extra_spaces(self) -> None:
+        blocks = _group_text_lines(
+            "标题\n第一行内容\n第二行内容。\n1. 第一项\n续行。",
+            is_document_start=True,
+        )
+
+        self.assertEqual(
+            blocks,
+            [
+                ("title", "标题"),
+                ("body", "第一行内容第二行内容。"),
+                ("ordered", "第一项续行。"),
+            ],
+        )
+
+    def test_list_item_colon_keeps_following_explanation_in_same_item(self) -> None:
+        blocks = _group_text_lines(
+            "四、总结\n1. 第一项：\n这是第一项的说明。\n2. 第二项：\n这是第二项的说明。"
+        )
+
+        self.assertEqual(
+            blocks,
+            [
+                ("heading1", "四、总结"),
+                ("ordered", "第一项：这是第一项的说明。"),
+                ("ordered", "第二项：这是第二项的说明。"),
+            ],
+        )
+
+    def test_common_parenthesized_numbers_are_ordered_items(self) -> None:
+        blocks = _group_text_lines("（1）第一项。\n(2) 第二项。")
+
+        self.assertEqual(
+            blocks,
+            [("ordered", "第一项。"), ("ordered", "第二项。")],
+        )
+
+    def test_common_math_operator_line_is_a_formula(self) -> None:
+        blocks = _group_text_lines("目标函数：\n∑ᵢ xᵢ = 1")
+
+        self.assertEqual(
+            blocks,
+            [("body", "目标函数："), ("formula", "∑ᵢ xᵢ = 1")],
+        )
+
+    def test_ocr_content_recovers_heading_and_restarts_list(self) -> None:
+        document = Document()
+        _set_document_styles(document)
+
+        _add_content_lines(
+            document,
+            "1. 第一项：\n这是第一项的说明。\n参考文献\n1. 文献",
+            "text",
+        )
+
+        paragraphs = [paragraph for paragraph in document.paragraphs if paragraph.text]
+        self.assertEqual(paragraphs[0].style.name, "List Number")
+        self.assertEqual(paragraphs[0].text, "第一项：这是第一项的说明。")
+        self.assertEqual(paragraphs[1].style.name, "Heading 1")
+        self.assertEqual(paragraphs[2].style.name, "List Number")
+
+    def test_ordered_lists_restart_after_a_heading(self) -> None:
+        document = Document()
+        _set_document_styles(document)
+        _add_text_pages_with_sizes(
+            document,
+            ["1. 第一项\n2. 第二项", "3. 第三项", "参考文献\n1. 文献"],
+            None,
+        )
+
+        list_paragraphs = [
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "List Number"
+        ]
+        number_ids = [
+            paragraph._p.pPr.numPr.numId.val for paragraph in list_paragraphs
+        ]
+        self.assertEqual(number_ids[0], number_ids[1])
+        self.assertEqual(number_ids[1], number_ids[2])
+        self.assertNotEqual(number_ids[2], number_ids[3])
+
+    def test_bullet_items_use_bullet_numbering_definition(self) -> None:
+        document = Document()
+        _set_document_styles(document)
+        _add_text_pages_with_sizes(document, ["• 第一项\n• 第二项"], None)
+
+        bullet_paragraph = next(
+            paragraph
+            for paragraph in document.paragraphs
+            if paragraph.style.name == "List Bullet"
+        )
+        num_id = bullet_paragraph._p.pPr.numPr.numId.val
+        numbering = document.part.numbering_part.element
+        num = next(
+            element
+            for element in numbering.findall("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}num")
+            if element.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numId")
+            == str(num_id)
+        )
+        abstract_id = num.find(
+            "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}abstractNumId"
+        ).get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val")
+        abstract = next(
+            element
+            for element in numbering.findall(
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}abstractNum"
+            )
+            if element.get(
+                "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}abstractNumId"
+            )
+            == abstract_id
+        )
+        num_format = abstract.find(
+            ".//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}numFmt"
+        )
+        self.assertEqual(
+            num_format.get("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val"),
+            "bullet",
+        )
+
+    def test_decimal_section_heading_is_not_numbered_as_a_list(self) -> None:
+        document = Document()
+        _add_content_lines(document, "2.1 原始线性规划模型\n1. 普通编号条目", "text")
+
+        paragraphs = [paragraph for paragraph in document.paragraphs if paragraph.text]
+        self.assertEqual(paragraphs[0].style.name, "Heading 2")
+        self.assertEqual(paragraphs[1].style.name, "List Number")
+
+    def test_text_export_uses_source_page_size(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "a4-input.pdf"
+            docx_path = root / "output.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(595.28, 841.89))
+            canvas.drawString(72, 760, "Editable page text")
+            canvas.save()
+
+            export_text_pages_to_docx(
+                ["Editable page text"],
+                docx_path,
+                title="text-size-test",
+                source_pdf=pdf_path,
+            )
+
+            document = Document(str(docx_path))
+            section = document.sections[0]
+            self.assertAlmostEqual(section.page_width.inches, 595.28 / 72, places=2)
+            self.assertAlmostEqual(section.page_height.inches, 841.89 / 72, places=2)
+
     def test_hybrid_export_keeps_page_image_and_ocr_text(self) -> None:
         with TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
@@ -53,6 +216,89 @@ class HybridExportTest(unittest.TestCase):
             with zipfile.ZipFile(docx_path) as archive:
                 media = [name for name in archive.namelist() if name.startswith("word/media/")]
             self.assertEqual(len(media), 1)
+
+    def test_page_render_keeps_vector_overlay_on_full_page_image(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "image-with-overlay.pdf"
+            background_path = root / "background.png"
+            Image.new("RGB", (720, 480), color="white").save(background_path)
+            canvas = Canvas(str(pdf_path), pagesize=(360, 240))
+            canvas.drawImage(
+                ImageReader(str(background_path)),
+                0,
+                0,
+                width=360,
+                height=240,
+            )
+            canvas.setFillColorRGB(0, 0, 0)
+            canvas.drawString(36, 200, "Vector overlay text")
+            canvas.save()
+
+            page = next(
+                _iter_page_images(
+                    pdf_path,
+                    max_pixels=4 * 1024 * 1024,
+                    jpeg_quality=88,
+                )
+            )
+            with Image.open(BytesIO(page[1])) as rendered:
+                rgb = rendered.convert("RGB")
+                crop = rgb.crop((50, 40, 400, 160))
+                pixels = crop.load()
+                dark_pixels = sum(
+                    max(pixels[x, y]) < 100
+                    for x in range(crop.width)
+                    for y in range(crop.height)
+                )
+            self.assertGreater(dark_pixels, 10)
+
+    def test_source_page_export_does_not_append_white_text_pages(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "input.pdf"
+            docx_path = root / "output.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(360, 240))
+            canvas.drawString(36, 200, "Rendered PDF page")
+            canvas.rect(36, 36, 288, 120)
+            canvas.save()
+
+            export_source_pages_to_docx(
+                docx_path,
+                title="source-page-test",
+                source_pdf=pdf_path,
+            )
+
+            document = Document(str(docx_path))
+            paragraphs = "\n".join(p.text for p in document.paragraphs)
+            self.assertNotIn("Selectable text layer", paragraphs)
+            self.assertEqual(len(document.sections), 1)
+            with zipfile.ZipFile(docx_path) as archive:
+                media = [name for name in archive.namelist() if name.startswith("word/media/")]
+            self.assertEqual(len(media), 1)
+
+    def test_ocr_text_export_uses_source_page_size(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "a4-input.pdf"
+            docx_path = root / "output.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(595.28, 841.89))
+            canvas.drawString(72, 760, "OCR page text")
+            canvas.save()
+
+            export_results_to_docx(
+                [{"parsing_res_list": [{"block_content": "OCR page text"}]}],
+                docx_path,
+                title="ocr-size-test",
+                source_pdf=pdf_path,
+                mode="text",
+            )
+
+            section = Document(str(docx_path)).sections[0]
+            self.assertAlmostEqual(section.page_width.inches, 595.28 / 72, places=2)
+            self.assertAlmostEqual(section.page_height.inches, 841.89 / 72, places=2)
 
 
 if __name__ == "__main__":

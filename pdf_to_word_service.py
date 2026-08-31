@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -10,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,16 +27,14 @@ from pdf_to_word_exporter import (
     DEFAULT_PAGE_IMAGE_JPEG_QUALITY,
     DEFAULT_PAGE_IMAGE_MAX_PIXELS,
     EXPORT_MODES,
-    export_text_pages_to_docx,
-    export_results_to_docx,
 )
-from pdf_routing import analyze_pdf_text
-from run_validation import build_pipeline
+from pdf_worker import process_job
 
 
 ROOT = Path(__file__).resolve().parent
 LOGGER = logging.getLogger("pdf_to_word_service")
 ROUTE_MODES = frozenset({"auto", "text", "ocr"})
+TERMINAL_STATUSES = frozenset({"succeeded", "failed", "cancelled", "timed_out"})
 
 
 def _env_int(name: str, default: int) -> int:
@@ -67,10 +67,21 @@ def _iso(value: datetime | None) -> str | None:
 
 @dataclass
 class ServiceConfig:
-    engine: str = os.getenv("PDF_SERVICE_ENGINE", "structure-table-lite")
+    engine: str = os.getenv("PDF_SERVICE_ENGINE", "structure-lite")
+    worker_processes: int = _env_int("PDF_SERVICE_WORKER_PROCESSES", 1)
+    max_pending_jobs: int = _env_int("PDF_SERVICE_MAX_PENDING_JOBS", 4)
     route_mode: str = os.getenv("PDF_SERVICE_ROUTE_MODE", "auto").strip().lower()
     text_min_page_chars: int = _env_int("PDF_SERVICE_TEXT_MIN_PAGE_CHARS", 20)
     text_min_page_ratio: float = _env_float("PDF_SERVICE_TEXT_MIN_PAGE_RATIO", 0.6)
+    text_high_quality_ratio: float = _env_float(
+        "PDF_SERVICE_TEXT_HIGH_QUALITY_RATIO", 0.8
+    )
+    text_full_page_image_min_pixels: int = _env_int(
+        "PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS", 300_000
+    )
+    text_garbled_char_ratio: float = _env_float(
+        "PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO", 0.05
+    )
     export_mode: str = os.getenv("PDF_SERVICE_EXPORT_MODE", "hybrid").strip().lower()
     page_image_max_pixels: int = _env_int(
         "PDF_SERVICE_PAGE_IMAGE_MAX_PIXELS", DEFAULT_PAGE_IMAGE_MAX_PIXELS
@@ -85,9 +96,21 @@ class ServiceConfig:
     max_pages: int = _env_int("PDF_SERVICE_MAX_PAGES", 100)
     job_ttl_seconds: int = _env_int("PDF_SERVICE_JOB_TTL_SECONDS", 3600)
     cleanup_interval_seconds: int = _env_int("PDF_SERVICE_CLEANUP_INTERVAL_SECONDS", 60)
+    task_timeout_seconds: float = _env_float(
+        "PDF_SERVICE_TASK_TIMEOUT_SECONDS", 300.0
+    )
+    ocr_time_budget_seconds: float = _env_float(
+        "PDF_SERVICE_OCR_TIME_BUDGET_SECONDS", 60.0
+    )
     auth_token: str = os.getenv("PDF_SERVICE_TOKEN", "")
 
     def __post_init__(self) -> None:
+        if not 1 <= self.worker_processes <= 4:
+            raise RuntimeError("环境变量 PDF_SERVICE_WORKER_PROCESSES 必须在 1 到 4 之间")
+        if self.max_pending_jobs < self.worker_processes:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_MAX_PENDING_JOBS 不得小于 worker 进程数"
+            )
         if self.route_mode not in ROUTE_MODES:
             raise RuntimeError("环境变量 PDF_SERVICE_ROUTE_MODE 必须是 auto、text 或 ocr")
         if self.text_min_page_chars < 1:
@@ -95,6 +118,18 @@ class ServiceConfig:
         if not 0 < self.text_min_page_ratio <= 1:
             raise RuntimeError(
                 "环境变量 PDF_SERVICE_TEXT_MIN_PAGE_RATIO 必须大于 0 且不超过 1"
+            )
+        if not 0 < self.text_high_quality_ratio <= 1:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_TEXT_HIGH_QUALITY_RATIO 必须大于 0 且不超过 1"
+            )
+        if self.text_full_page_image_min_pixels < 1:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_TEXT_FULL_PAGE_IMAGE_MIN_PIXELS 必须大于 0"
+            )
+        if not 0 <= self.text_garbled_char_ratio <= 1:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_TEXT_GARBLED_CHAR_RATIO 必须在 0 到 1 之间"
             )
         if self.export_mode not in EXPORT_MODES:
             raise RuntimeError(
@@ -106,11 +141,21 @@ class ServiceConfig:
             raise RuntimeError(
                 "环境变量 PDF_SERVICE_PAGE_IMAGE_JPEG_QUALITY 必须在 1 到 100 之间"
             )
+        if self.task_timeout_seconds <= 0:
+            raise RuntimeError("环境变量 PDF_SERVICE_TASK_TIMEOUT_SECONDS 必须大于 0")
+        if self.ocr_time_budget_seconds <= 0:
+            raise RuntimeError(
+                "环境变量 PDF_SERVICE_OCR_TIME_BUDGET_SECONDS 必须大于 0"
+            )
 
 
 CONFIG = ServiceConfig()
 JOB_ROOT = CONFIG.data_root / "jobs"
 JOB_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+class QueueFullError(RuntimeError):
+    """任务队列达到容量上限。"""
 
 
 @dataclass
@@ -120,6 +165,9 @@ class Job:
     workspace: Path
     input_path: Path
     output_path: Path
+    progress_path: Path
+    stage_log_path: Path
+    cancel_path: Path
     page_count: int
     created_at: datetime = field(default_factory=_utc_now)
     started_at: datetime | None = None
@@ -128,9 +176,9 @@ class Job:
     progress: int = 0
     route: str = "pending"
     route_reason: str | None = None
+    worker_pid: int | None = None
     error: str | None = None
-    cancel_event: threading.Event = field(default_factory=threading.Event)
-    future: Future[None] | None = None
+    future: Future[dict[str, Any]] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -140,6 +188,7 @@ class Job:
             "progress": self.progress,
             "route": self.route,
             "route_reason": self.route_reason,
+            "worker_pid": self.worker_pid,
             "page_count": self.page_count,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
@@ -154,40 +203,71 @@ class Job:
 
 
 class JobManager:
-    """管理单进程内存任务，并以单工作线程保护模型资源。"""
+    """管理 API 进程中的任务状态，并将转换交给独立 worker 进程。"""
 
     def __init__(self) -> None:
         self._jobs: dict[str, Job] = {}
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="pdf-converter"
+        context_name = "spawn" if os.name == "nt" else "fork"
+        self._executor = ProcessPoolExecutor(
+            max_workers=CONFIG.worker_processes,
+            mp_context=multiprocessing.get_context(context_name),
         )
-        self._pipeline: Any | None = None
-        self._pipeline_lock = threading.Lock()
+
+    def _active_job_count_locked(self) -> int:
+        return sum(
+            job.status in {"queued", "processing"} for job in self._jobs.values()
+        )
+
+    def has_capacity(self) -> bool:
+        with self._lock:
+            return self._active_job_count_locked() < CONFIG.max_pending_jobs
 
     def create(self, filename: str, source_path: Path, page_count: int) -> Job:
+        with self._lock:
+            if self._active_job_count_locked() >= CONFIG.max_pending_jobs:
+                raise QueueFullError("任务队列已满，请稍后重试")
+
         job_id = uuid.uuid4().hex
         workspace = JOB_ROOT / job_id
         workspace.mkdir(parents=True, exist_ok=False)
         input_path = workspace / "input.pdf"
         output_path = workspace / "result.docx"
-        shutil.move(str(source_path), input_path)
-        job = Job(
-            job_id=job_id,
-            filename=filename,
-            workspace=workspace,
-            input_path=input_path,
-            output_path=output_path,
-            page_count=page_count,
-        )
-        with self._lock:
-            self._jobs[job_id] = job
-        job.future = self._executor.submit(self._process, job)
-        return job
+        progress_path = workspace / "progress.json"
+        stage_log_path = workspace / "stages.jsonl"
+        cancel_path = workspace / "cancel.requested"
+        try:
+            shutil.move(str(source_path), input_path)
+            job = Job(
+                job_id=job_id,
+                filename=filename,
+                workspace=workspace,
+                input_path=input_path,
+                output_path=output_path,
+                progress_path=progress_path,
+                stage_log_path=stage_log_path,
+                cancel_path=cancel_path,
+                page_count=page_count,
+            )
+            with self._lock:
+                self._jobs[job_id] = job
+            job.future = self._executor.submit(process_job, self._worker_payload(job))
+            job.future.add_done_callback(
+                lambda future, current_job=job: self._on_worker_done(current_job, future)
+            )
+            return job
+        except Exception:
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
-            return self._jobs.get(job_id)
+            job = self._jobs.get(job_id)
+        if job is not None:
+            self._refresh_from_worker(job)
+        return job
 
     def cancel(self, job_id: str) -> Job:
         job = self.get(job_id)
@@ -195,7 +275,7 @@ class JobManager:
             raise KeyError(job_id)
         with self._lock:
             if job.status in {"queued", "processing"}:
-                job.cancel_event.set()
+                job.cancel_path.touch(exist_ok=True)
                 if job.status == "queued" and job.future and job.future.cancel():
                     job.status = "cancelled"
                     job.progress = 0
@@ -216,22 +296,64 @@ class JobManager:
         return len(expired)
 
     def model_loaded(self) -> bool:
-        return self._pipeline is not None
+        """返回 API 进程是否持有模型；模型实际驻留在 worker 进程中。"""
+        return False
 
     def close(self) -> None:
         self._executor.shutdown(wait=True, cancel_futures=True)
-        if self._pipeline is not None:
-            try:
-                self._pipeline.close()
-            except Exception:
-                LOGGER.exception("关闭 PaddleOCR 模型失败")
 
-    def _get_pipeline(self) -> Any:
-        with self._pipeline_lock:
-            if self._pipeline is None:
-                LOGGER.info("加载模型：%s", CONFIG.engine)
-                self._pipeline = build_pipeline(CONFIG.engine)
-            return self._pipeline
+    def _worker_payload(self, job: Job) -> dict[str, Any]:
+        return {
+            "job_id": job.job_id,
+            "filename": job.filename,
+            "input_path": str(job.input_path),
+            "output_path": str(job.output_path),
+            "progress_path": str(job.progress_path),
+            "stage_log_path": str(job.stage_log_path),
+            "cancel_path": str(job.cancel_path),
+            "page_count": job.page_count,
+            "engine": CONFIG.engine,
+            "route_mode": CONFIG.route_mode,
+            "text_min_page_chars": CONFIG.text_min_page_chars,
+            "text_min_page_ratio": CONFIG.text_min_page_ratio,
+            "text_high_quality_ratio": CONFIG.text_high_quality_ratio,
+            "text_full_page_image_min_pixels": CONFIG.text_full_page_image_min_pixels,
+            "text_garbled_char_ratio": CONFIG.text_garbled_char_ratio,
+            "export_mode": CONFIG.export_mode,
+            "page_image_max_pixels": CONFIG.page_image_max_pixels,
+            "page_image_jpeg_quality": CONFIG.page_image_jpeg_quality,
+            "task_timeout_seconds": CONFIG.task_timeout_seconds,
+            "ocr_time_budget_seconds": CONFIG.ocr_time_budget_seconds,
+        }
+
+    def _refresh_from_worker(self, job: Job) -> None:
+        try:
+            payload = json.loads(job.progress_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        with self._lock:
+            if job.status in TERMINAL_STATUSES:
+                return
+            status = payload.get("status")
+            if isinstance(status, str):
+                job.status = status
+                if status == "processing" and job.started_at is None:
+                    job.started_at = _utc_now()
+            progress = payload.get("progress")
+            if isinstance(progress, int):
+                job.progress = progress
+            route = payload.get("route")
+            if isinstance(route, str):
+                job.route = route
+            route_reason = payload.get("route_reason")
+            if isinstance(route_reason, str):
+                job.route_reason = route_reason
+            worker_pid = payload.get("worker_pid")
+            if isinstance(worker_pid, int):
+                job.worker_pid = worker_pid
+            error = payload.get("error")
+            if isinstance(error, str):
+                job.error = error
 
     def _set_state(
         self,
@@ -241,6 +363,7 @@ class JobManager:
         progress: int | None = None,
         route: str | None = None,
         route_reason: str | None = None,
+        worker_pid: int | None = None,
         error: str | None = None,
     ) -> None:
         with self._lock:
@@ -252,216 +375,48 @@ class JobManager:
                 job.route = route
             if route_reason is not None:
                 job.route_reason = route_reason
+            if worker_pid is not None:
+                job.worker_pid = worker_pid
             if error is not None:
                 job.error = error
 
-    def _process(self, job: Job) -> None:
-        task_started = time.perf_counter()
-        LOGGER.info(
-            "pdf_to_word_stage job_id=%s stage=started filename=%s page_count=%s",
-            job.job_id,
-            job.filename,
-            job.page_count,
-        )
-        try:
-            with self._lock:
-                job.status = "processing"
+    def _on_worker_done(
+        self, job: Job, future: Future[dict[str, Any]]
+    ) -> None:
+        with self._lock:
+            if job.started_at is None:
                 job.started_at = _utc_now()
-                job.progress = 5
+        if future.cancelled():
+            with self._lock:
+                if job.status not in TERMINAL_STATUSES:
+                    job.status = "cancelled"
+                    job.progress = 0
+            job.finished_at = _utc_now()
+            return
 
-            analysis: Any | None = None
-            route = "ocr"
-            route_reason = "forced_ocr"
-            if CONFIG.route_mode != "ocr":
-                analysis_started = time.perf_counter()
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=text_analysis_started",
-                    job.job_id,
-                )
-                try:
-                    analysis = analyze_pdf_text(
-                        job.input_path,
-                        min_page_chars=CONFIG.text_min_page_chars,
-                    )
-                    has_text_layer = analysis.has_usable_text_layer(
-                        min_page_chars=CONFIG.text_min_page_chars,
-                        min_page_ratio=CONFIG.text_min_page_ratio,
-                    )
-                    LOGGER.info(
-                        "pdf_to_word_stage job_id=%s stage=text_analysis_completed elapsed_sec=%.3f usable_page_count=%s page_count=%s text_char_count=%s usable_page_ratio=%.3f has_text_layer=%s",
-                        job.job_id,
-                        time.perf_counter() - analysis_started,
-                        analysis.usable_page_count,
-                        analysis.page_count,
-                        analysis.text_char_count,
-                        analysis.usable_page_ratio,
-                        has_text_layer,
-                    )
-                    if CONFIG.route_mode == "text":
-                        if not has_text_layer:
-                            raise RuntimeError("PDF 不满足文本层快速路线的检测阈值")
-                        route = "text"
-                        route_reason = "forced_text"
-                    elif has_text_layer:
-                        route = "text"
-                        route_reason = "text_layer_detected"
-                    else:
-                        route_reason = "text_layer_not_usable"
-                except Exception:
-                    if CONFIG.route_mode == "text":
-                        raise
-                    LOGGER.exception(
-                        "pdf_to_word_stage job_id=%s stage=text_analysis_failed fallback=ocr",
-                        job.job_id,
-                    )
-                    analysis = None
-                    route_reason = "text_analysis_failed"
-
+        try:
+            result = future.result()
+        except Exception as error:
+            LOGGER.exception("worker 进程未正常返回任务 %s", job.job_id)
             self._set_state(
                 job,
-                route=route,
-                route_reason=route_reason,
-                progress=15,
+                status="failed",
+                progress=0,
+                error=f"{type(error).__name__}: {error}",
             )
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=route_selected route=%s reason=%s",
-                job.job_id,
-                route,
-                route_reason,
-            )
+            job.finished_at = _utc_now()
+            return
 
-            def export_stage(stage: str, details: dict[str, Any]) -> None:
-                detail_text = " ".join(
-                    f"{key}={value}" for key, value in details.items()
-                )
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=%s%s",
-                    job.job_id,
-                    stage,
-                    f" {detail_text}" if detail_text else "",
-                )
-
-            if route == "text":
-                if analysis is None:
-                    raise RuntimeError("文本层快速路线缺少分析结果")
-                self._set_state(job, progress=60)
-                export_started = time.perf_counter()
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=docx_export_started route=text page_count=%s",
-                    job.job_id,
-                    analysis.page_count,
-                )
-                export_text_pages_to_docx(
-                    analysis.page_texts,
-                    job.output_path,
-                    title=Path(job.filename).stem,
-                    stage_callback=export_stage,
-                )
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=docx_export_completed route=text elapsed_sec=%.3f output_bytes=%s",
-                    job.job_id,
-                    time.perf_counter() - export_started,
-                    job.output_path.stat().st_size,
-                )
-                self._set_state(job, status="succeeded", progress=100)
-                return
-
-            model_started = time.perf_counter()
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=model_loading_started engine=%s",
-                job.job_id,
-                CONFIG.engine,
-            )
-            pipeline = self._get_pipeline()
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=model_loading_completed elapsed_sec=%.3f",
-                job.job_id,
-                time.perf_counter() - model_started,
-            )
-
-            results: list[dict[str, Any]] = []
-            inference_started = time.perf_counter()
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=inference_started input=%s",
-                job.job_id,
-                job.input_path.name,
-            )
-            for result in pipeline.predict_iter(str(job.input_path)):
-                if job.cancel_event.is_set():
-                    LOGGER.info(
-                        "pdf_to_word_stage job_id=%s stage=cancelled result_count=%s",
-                        job.job_id,
-                        len(results),
-                    )
-                    self._set_state(job, status="cancelled", progress=0)
-                    return
-                results.append(result)
-                progress = min(80, 10 + int(70 * len(results) / max(job.page_count, 1)))
-                self._set_state(job, progress=progress)
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=inference_batch_completed result_count=%s progress=%s",
-                    job.job_id,
-                    len(results),
-                    progress,
-                )
-
-            if job.cancel_event.is_set():
-                LOGGER.info(
-                    "pdf_to_word_stage job_id=%s stage=cancelled result_count=%s",
-                    job.job_id,
-                    len(results),
-                )
-                self._set_state(job, status="cancelled", progress=0)
-                return
-
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=inference_completed result_count=%s elapsed_sec=%.3f",
-                job.job_id,
-                len(results),
-                time.perf_counter() - inference_started,
-            )
-            self._set_state(job, progress=90)
-            export_started = time.perf_counter()
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=docx_export_started route=ocr result_count=%s",
-                job.job_id,
-                len(results),
-            )
-            export_results_to_docx(
-                results,
-                job.output_path,
-                title=Path(job.filename).stem,
-                source_pdf=job.input_path,
-                mode=CONFIG.export_mode,
-                image_max_pixels=CONFIG.page_image_max_pixels,
-                image_jpeg_quality=CONFIG.page_image_jpeg_quality,
-                stage_callback=export_stage,
-            )
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=docx_export_completed route=ocr elapsed_sec=%.3f output_bytes=%s",
-                job.job_id,
-                time.perf_counter() - export_started,
-                job.output_path.stat().st_size,
-            )
-            self._set_state(job, status="succeeded", progress=100)
-        except Exception as error:
-            LOGGER.exception("任务 %s 处理失败", job.job_id)
-            LOGGER.error(
-                "pdf_to_word_stage job_id=%s stage=failed elapsed_sec=%.3f error_type=%s",
-                job.job_id,
-                time.perf_counter() - task_started,
-                type(error).__name__,
-            )
-            self._set_state(job, status="failed", progress=0, error=f"{type(error).__name__}: {error}")
-        finally:
-            with self._lock:
-                job.finished_at = _utc_now()
-            LOGGER.info(
-                "pdf_to_word_stage job_id=%s stage=finished status=%s elapsed_sec=%.3f",
-                job.job_id,
-                job.status,
-                time.perf_counter() - task_started,
-            )
+        self._set_state(
+            job,
+            status=str(result.get("status", "failed")),
+            progress=int(result.get("progress", 0)),
+            route=result.get("route"),
+            route_reason=result.get("route_reason"),
+            worker_pid=result.get("worker_pid"),
+            error=result.get("error"),
+        )
+        job.finished_at = _utc_now()
 
 
 MANAGER = JobManager()
@@ -567,20 +522,29 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "engine": CONFIG.engine,
+        "worker_processes": CONFIG.worker_processes,
+        "max_pending_jobs": CONFIG.max_pending_jobs,
         "route_mode": CONFIG.route_mode,
         "text_min_page_chars": CONFIG.text_min_page_chars,
         "text_min_page_ratio": CONFIG.text_min_page_ratio,
+        "text_high_quality_ratio": CONFIG.text_high_quality_ratio,
+        "text_full_page_image_min_pixels": CONFIG.text_full_page_image_min_pixels,
+        "text_garbled_char_ratio": CONFIG.text_garbled_char_ratio,
         "export_mode": CONFIG.export_mode,
         "model_loaded": MANAGER.model_loaded(),
         "max_upload_bytes": CONFIG.max_upload_bytes,
         "max_pages": CONFIG.max_pages,
         "page_image_max_pixels": CONFIG.page_image_max_pixels,
+        "task_timeout_seconds": CONFIG.task_timeout_seconds,
+        "ocr_time_budget_seconds": CONFIG.ocr_time_budget_seconds,
     }
 
 
 @app.post("/api/pdf-to-word/jobs", dependencies=[Depends(_require_auth)])
 async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
     MANAGER.cleanup_expired()
+    if not MANAGER.has_capacity():
+        raise HTTPException(status_code=429, detail="任务队列已满，请稍后重试")
     staging_root = CONFIG.data_root / "staging"
     staging_root.mkdir(parents=True, exist_ok=True)
     staging_path = staging_root / f"{uuid.uuid4().hex}.upload"
@@ -592,6 +556,9 @@ async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
     except HTTPException:
         staging_path.unlink(missing_ok=True)
         raise
+    except QueueFullError as error:
+        staging_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=429, detail=str(error)) from error
     except Exception as error:
         staging_path.unlink(missing_ok=True)
         raise HTTPException(status_code=500, detail=f"创建任务失败：{error}") from error
