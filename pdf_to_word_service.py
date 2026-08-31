@@ -12,7 +12,7 @@ import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from concurrent.futures import CancelledError, Future, ProcessPoolExecutor
+from multiprocessing import Process
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +29,7 @@ from pdf_to_word_exporter import (
     EXPORT_MODES,
 )
 from pdf_worker import process_job
+from job_store import JobStore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -102,6 +103,7 @@ class ServiceConfig:
     ocr_time_budget_seconds: float = _env_float(
         "PDF_SERVICE_OCR_TIME_BUDGET_SECONDS", 60.0
     )
+    max_retries: int = _env_int("PDF_SERVICE_MAX_RETRIES", 1)
     auth_token: str = os.getenv("PDF_SERVICE_TOKEN", "")
 
     def __post_init__(self) -> None:
@@ -147,6 +149,8 @@ class ServiceConfig:
             raise RuntimeError(
                 "环境变量 PDF_SERVICE_OCR_TIME_BUDGET_SECONDS 必须大于 0"
             )
+        if not 0 <= self.max_retries <= 3:
+            raise RuntimeError("环境变量 PDF_SERVICE_MAX_RETRIES 必须在 0 到 3 之间")
 
 
 CONFIG = ServiceConfig()
@@ -178,7 +182,12 @@ class Job:
     route_reason: str | None = None
     worker_pid: int | None = None
     error: str | None = None
-    future: Future[dict[str, Any]] | None = None
+    attempt: int = 0
+    max_retries: int = 0
+    process: Process | None = field(default=None, repr=False, compare=False)
+    worker_reported_status: str | None = field(
+        default=None, repr=False, compare=False
+    )
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -194,6 +203,8 @@ class Job:
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "error": self.error,
+            "attempt": self.attempt,
+            "max_retries": self.max_retries,
             "download_url": (
                 f"/api/pdf-to-word/jobs/{self.job_id}/result"
                 if self.status == "succeeded"
@@ -201,18 +212,120 @@ class Job:
             ),
         }
 
+    def as_record(self) -> dict[str, Any]:
+        """返回可写入任务存储的标量字段。"""
+        return {
+            "job_id": self.job_id,
+            "filename": self.filename,
+            "workspace": str(self.workspace),
+            "input_path": str(self.input_path),
+            "output_path": str(self.output_path),
+            "progress_path": str(self.progress_path),
+            "stage_log_path": str(self.stage_log_path),
+            "cancel_path": str(self.cancel_path),
+            "page_count": self.page_count,
+            "created_at": _iso(self.created_at),
+            "started_at": _iso(self.started_at),
+            "finished_at": _iso(self.finished_at),
+            "status": self.status,
+            "progress": self.progress,
+            "route": self.route,
+            "route_reason": self.route_reason,
+            "worker_pid": self.worker_pid,
+            "error": self.error,
+            "attempt": self.attempt,
+            "max_retries": self.max_retries,
+        }
+
+
+def _parse_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
 
 class JobManager:
-    """管理 API 进程中的任务状态，并将转换交给独立 worker 进程。"""
+    """持久化任务状态，并监管可独立终止的转换 worker 进程。"""
 
-    def __init__(self) -> None:
+    def __init__(self, store_path: Path | None = None) -> None:
         self._jobs: dict[str, Job] = {}
+        self._processes: dict[str, Process] = {}
         self._lock = threading.Lock()
         context_name = "spawn" if os.name == "nt" else "fork"
-        self._executor = ProcessPoolExecutor(
-            max_workers=CONFIG.worker_processes,
-            mp_context=multiprocessing.get_context(context_name),
+        self._mp_context = multiprocessing.get_context(context_name)
+        self._store = JobStore(store_path or CONFIG.data_root / "jobs.sqlite3")
+        self._stop_event = threading.Event()
+        self._closed = False
+        self._load_persisted_jobs()
+        self._scheduler_thread = threading.Thread(
+            target=self._scheduler_loop,
+            name="pdf-worker-supervisor",
+            daemon=True,
         )
+        self._scheduler_thread.start()
+
+    def _load_persisted_jobs(self) -> None:
+        for record in self._store.load_all():
+            job = self._job_from_record(record)
+            if job is None:
+                continue
+            if job.status in {"queued", "processing"}:
+                if not job.input_path.is_file():
+                    job.status = "failed"
+                    job.progress = 0
+                    job.finished_at = _utc_now()
+                    job.error = "服务重启后找不到任务输入文件"
+                elif job.attempt > job.max_retries:
+                    job.status = "failed"
+                    job.progress = 0
+                    job.finished_at = _utc_now()
+                    job.error = "服务重启时任务已耗尽重试次数"
+                else:
+                    job.status = "queued"
+                    job.progress = 0
+                    job.started_at = None
+                    job.finished_at = None
+                    job.worker_pid = None
+                    job.error = "服务重启后任务重新排队"
+                    job.cancel_path.unlink(missing_ok=True)
+            self._jobs[job.job_id] = job
+            self._store.save(job.as_record())
+
+    @staticmethod
+    def _job_from_record(record: dict[str, Any]) -> Job | None:
+        try:
+            return Job(
+                job_id=str(record["job_id"]),
+                filename=str(record["filename"]),
+                workspace=Path(str(record["workspace"])),
+                input_path=Path(str(record["input_path"])),
+                output_path=Path(str(record["output_path"])),
+                progress_path=Path(str(record["progress_path"])),
+                stage_log_path=Path(str(record["stage_log_path"])),
+                cancel_path=Path(str(record["cancel_path"])),
+                page_count=int(record["page_count"]),
+                created_at=_parse_datetime(record.get("created_at")) or _utc_now(),
+                started_at=_parse_datetime(record.get("started_at")),
+                finished_at=_parse_datetime(record.get("finished_at")),
+                status=str(record.get("status") or "queued"),
+                progress=int(record.get("progress") or 0),
+                route=str(record.get("route") or "pending"),
+                route_reason=record.get("route_reason"),
+                worker_pid=(
+                    int(record["worker_pid"])
+                    if record.get("worker_pid") is not None
+                    else None
+                ),
+                error=record.get("error"),
+                attempt=int(record.get("attempt") or 0),
+                max_retries=int(record.get("max_retries") or 0),
+            )
+        except (KeyError, TypeError, ValueError):
+            LOGGER.exception("跳过无法读取的持久化任务记录")
+            return None
 
     def _active_job_count_locked(self) -> int:
         return sum(
@@ -227,7 +340,6 @@ class JobManager:
         with self._lock:
             if self._active_job_count_locked() >= CONFIG.max_pending_jobs:
                 raise QueueFullError("任务队列已满，请稍后重试")
-
         job_id = uuid.uuid4().hex
         workspace = JOB_ROOT / job_id
         workspace.mkdir(parents=True, exist_ok=False)
@@ -236,8 +348,10 @@ class JobManager:
         progress_path = workspace / "progress.json"
         stage_log_path = workspace / "stages.jsonl"
         cancel_path = workspace / "cancel.requested"
+        moved_input = False
         try:
             shutil.move(str(source_path), input_path)
+            moved_input = True
             job = Job(
                 job_id=job_id,
                 filename=filename,
@@ -248,14 +362,21 @@ class JobManager:
                 stage_log_path=stage_log_path,
                 cancel_path=cancel_path,
                 page_count=page_count,
+                max_retries=CONFIG.max_retries,
             )
             with self._lock:
+                if self._active_job_count_locked() >= CONFIG.max_pending_jobs:
+                    raise QueueFullError("任务队列已满，请稍后重试")
                 self._jobs[job_id] = job
-            job.future = self._executor.submit(process_job, self._worker_payload(job))
-            job.future.add_done_callback(
-                lambda future, current_job=job: self._on_worker_done(current_job, future)
-            )
+                self._store.save(job.as_record())
             return job
+        except QueueFullError:
+            if moved_input and input_path.is_file() and not source_path.exists():
+                shutil.move(str(input_path), source_path)
+            with self._lock:
+                self._jobs.pop(job_id, None)
+            shutil.rmtree(workspace, ignore_errors=True)
+            raise
         except Exception:
             with self._lock:
                 self._jobs.pop(job_id, None)
@@ -274,12 +395,29 @@ class JobManager:
         if job is None:
             raise KeyError(job_id)
         with self._lock:
-            if job.status in {"queued", "processing"}:
-                job.cancel_path.touch(exist_ok=True)
-                if job.status == "queued" and job.future and job.future.cancel():
-                    job.status = "cancelled"
-                    job.progress = 0
-                    job.finished_at = _utc_now()
+            status = job.status
+            if status == "queued":
+                job.status = "cancelled"
+                job.progress = 0
+                job.finished_at = _utc_now()
+                job.error = "任务已取消"
+                self._store.save(job.as_record())
+            elif status != "processing":
+                return job
+        if status == "queued":
+            self._write_manager_state(job, "cancelled", "cancelled")
+            return job
+
+        job.cancel_path.touch(exist_ok=True)
+        self._stop_process(job.job_id)
+        with self._lock:
+            job.status = "cancelled"
+            job.progress = 0
+            job.finished_at = _utc_now()
+            job.worker_pid = None
+            job.error = "任务已取消"
+            self._store.save(job.as_record())
+        self._write_manager_state(job, "cancelled", "cancelled")
         return job
 
     def cleanup_expired(self) -> int:
@@ -291,6 +429,7 @@ class JobManager:
                     expired.append(job)
             for job in expired:
                 self._jobs.pop(job.job_id, None)
+        self._store.delete_many(job.job_id for job in expired)
         for job in expired:
             shutil.rmtree(job.workspace, ignore_errors=True)
         return len(expired)
@@ -300,7 +439,27 @@ class JobManager:
         return False
 
     def close(self) -> None:
-        self._executor.shutdown(wait=True, cancel_futures=True)
+        if self._closed:
+            return
+        self._closed = True
+        self._stop_event.set()
+        self._scheduler_thread.join(timeout=5)
+        with self._lock:
+            jobs = [
+                job for job in self._jobs.values() if job.status == "processing"
+            ]
+        for job in jobs:
+            self._stop_process(job.job_id)
+            with self._lock:
+                if job.status == "processing":
+                    job.status = "queued"
+                    job.progress = 0
+                    job.started_at = None
+                    job.finished_at = None
+                    job.worker_pid = None
+                    job.error = "服务停止后任务等待恢复"
+                    self._store.save(job.as_record())
+            self._write_manager_state(job, "service_stopped", "queued")
 
     def _worker_payload(self, job: Job) -> dict[str, Any]:
         return {
@@ -324,9 +483,183 @@ class JobManager:
             "page_image_jpeg_quality": CONFIG.page_image_jpeg_quality,
             "task_timeout_seconds": CONFIG.task_timeout_seconds,
             "ocr_time_budget_seconds": CONFIG.ocr_time_budget_seconds,
+            "attempt": job.attempt,
         }
 
+    def _scheduler_loop(self) -> None:
+        while not self._stop_event.is_set():
+            with self._lock:
+                jobs = list(self._jobs.values())
+            for job in jobs:
+                self._refresh_from_worker(job)
+                self._monitor_process(job)
+
+            with self._lock:
+                available = CONFIG.worker_processes - len(self._processes)
+                queued = sorted(
+                    (
+                        job
+                        for job in self._jobs.values()
+                        if job.status == "queued"
+                    ),
+                    key=lambda item: item.created_at,
+                )
+            for job in queued[: max(available, 0)]:
+                self._start_process(job)
+            self._stop_event.wait(0.1)
+
+    def _start_process(self, job: Job) -> None:
+        with self._lock:
+            if job.status != "queued" or len(self._processes) >= CONFIG.worker_processes:
+                return
+            job.attempt += 1
+            job.status = "processing"
+            job.progress = 5
+            job.started_at = _utc_now()
+            job.finished_at = None
+            job.worker_pid = None
+            job.error = None
+            job.route = "pending"
+            job.route_reason = None
+            job.worker_reported_status = None
+            job.cancel_path.unlink(missing_ok=True)
+            job.output_path.unlink(missing_ok=True)
+            process = self._mp_context.Process(
+                target=process_job,
+                args=(self._worker_payload(job),),
+                name=f"pdf-worker-{job.job_id[:8]}",
+            )
+            self._processes[job.job_id] = process
+            self._store.save(job.as_record())
+        try:
+            process.start()
+        except Exception as error:
+            with self._lock:
+                self._processes.pop(job.job_id, None)
+            self._handle_attempt_failure(
+                job,
+                "failed",
+                f"worker 启动失败：{type(error).__name__}: {error}",
+            )
+            return
+        with self._lock:
+            job.worker_pid = process.pid
+            self._store.save(job.as_record())
+
+    def _monitor_process(self, job: Job) -> None:
+        with self._lock:
+            process = self._processes.get(job.job_id)
+            status = job.status
+        if process is None:
+            return
+        if process.is_alive():
+            if status in {"queued", "processing"} and self._deadline_exceeded(job):
+                self._stop_process(job.job_id)
+                self._handle_attempt_failure(
+                    job,
+                    "timed_out",
+                    f"任务超过时间预算（attempt={job.attempt}）",
+                )
+            return
+
+        process.join(timeout=0)
+        with self._lock:
+            self._processes.pop(job.job_id, None)
+            job.process = None
+            status = job.status
+            error = job.error
+            worker_reported_status = job.worker_reported_status
+        if status == "succeeded" and job.output_path.is_file():
+            with self._lock:
+                job.finished_at = job.finished_at or _utc_now()
+                self._store.save(job.as_record())
+            return
+        if status == "cancelled":
+            return
+        if worker_reported_status == "timed_out" or status == "timed_out":
+            self._handle_attempt_failure(
+                job,
+                "timed_out",
+                error or "worker 达到软时间预算",
+            )
+            return
+        exit_code = process.exitcode
+        self._handle_attempt_failure(
+            job,
+            "failed",
+            error or f"worker 异常退出，exitcode={exit_code}",
+        )
+
+    def _deadline_exceeded(self, job: Job) -> bool:
+        if job.started_at is None:
+            return False
+        budget = (
+            CONFIG.ocr_time_budget_seconds
+            if job.route == "ocr"
+            else CONFIG.task_timeout_seconds
+        )
+        return (_utc_now() - job.started_at).total_seconds() > budget
+
+    def _stop_process(self, job_id: str) -> None:
+        with self._lock:
+            process = self._processes.pop(job_id, None)
+        if process is None:
+            return
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            kill = getattr(process, "kill", None)
+            if kill is not None:
+                kill()
+                process.join(timeout=2)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is not None:
+                job.process = None
+
+    def _handle_attempt_failure(
+        self,
+        job: Job,
+        status: str,
+        error: str,
+    ) -> None:
+        with self._lock:
+            if job.status == "cancelled":
+                return
+            if job.attempt <= job.max_retries:
+                job.status = "queued"
+                job.progress = 0
+                job.started_at = None
+                job.finished_at = None
+                job.worker_pid = None
+                job.error = (
+                    f"{error}；将在重试次数 {job.attempt}/{job.max_retries} 后重新执行"
+                )
+                job.route = "pending"
+                job.route_reason = None
+                job.output_path.unlink(missing_ok=True)
+                self._store.save(job.as_record())
+                retry = True
+            else:
+                job.status = status
+                job.progress = 0
+                job.finished_at = _utc_now()
+                job.worker_pid = None
+                job.error = error
+                self._store.save(job.as_record())
+                retry = False
+        if retry:
+            self._write_manager_state(job, "retry_scheduled", "queued")
+        else:
+            self._write_manager_state(job, "manager_finished", status)
+
     def _refresh_from_worker(self, job: Job) -> None:
+        with self._lock:
+            if job.status in TERMINAL_STATUSES:
+                return
+            if job.status == "queued" and job.job_id not in self._processes:
+                return
         try:
             payload = json.loads(job.progress_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -335,10 +668,10 @@ class JobManager:
             if job.status in TERMINAL_STATUSES:
                 return
             status = payload.get("status")
-            if isinstance(status, str):
+            if status in {"failed", "timed_out"}:
+                job.worker_reported_status = status
+            elif isinstance(status, str):
                 job.status = status
-                if status == "processing" and job.started_at is None:
-                    job.started_at = _utc_now()
             progress = payload.get("progress")
             if isinstance(progress, int):
                 job.progress = progress
@@ -354,72 +687,52 @@ class JobManager:
             error = payload.get("error")
             if isinstance(error, str):
                 job.error = error
+            self._store.save(job.as_record())
 
-    def _set_state(
-        self,
-        job: Job,
-        *,
-        status: str | None = None,
-        progress: int | None = None,
-        route: str | None = None,
-        route_reason: str | None = None,
-        worker_pid: int | None = None,
-        error: str | None = None,
-    ) -> None:
-        with self._lock:
-            if status is not None:
-                job.status = status
-            if progress is not None:
-                job.progress = progress
-            if route is not None:
-                job.route = route
-            if route_reason is not None:
-                job.route_reason = route_reason
-            if worker_pid is not None:
-                job.worker_pid = worker_pid
-            if error is not None:
-                job.error = error
-
-    def _on_worker_done(
-        self, job: Job, future: Future[dict[str, Any]]
-    ) -> None:
-        with self._lock:
-            if job.started_at is None:
-                job.started_at = _utc_now()
-        if future.cancelled():
-            with self._lock:
-                if job.status not in TERMINAL_STATUSES:
-                    job.status = "cancelled"
-                    job.progress = 0
-            job.finished_at = _utc_now()
-            return
-
-        try:
-            result = future.result()
-        except Exception as error:
-            LOGGER.exception("worker 进程未正常返回任务 %s", job.job_id)
-            self._set_state(
-                job,
-                status="failed",
-                progress=0,
-                error=f"{type(error).__name__}: {error}",
-            )
-            job.finished_at = _utc_now()
-            return
-
-        self._set_state(
-            job,
-            status=str(result.get("status", "failed")),
-            progress=int(result.get("progress", 0)),
-            route=result.get("route"),
-            route_reason=result.get("route_reason"),
-            worker_pid=result.get("worker_pid"),
-            error=result.get("error"),
+    def _write_manager_state(self, job: Job, stage: str, status: str) -> None:
+        event = {
+            "stage": stage,
+            "status": status,
+            "progress": job.progress,
+            "route": job.route,
+            "route_reason": job.route_reason,
+            "error": job.error,
+            "worker_pid": job.worker_pid,
+            "updated_at": _utc_now().isoformat(),
+            "job_id": job.job_id,
+            "attempt": job.attempt,
+        }
+        temporary_path = job.progress_path.with_name(
+            f".{job.progress_path.name}.manager.tmp"
         )
-        job.finished_at = _utc_now()
+        try:
+            job.progress_path.parent.mkdir(parents=True, exist_ok=True)
+            temporary_path.write_text(
+                json.dumps(event, ensure_ascii=False), encoding="utf-8"
+            )
+            for attempt in range(10):
+                try:
+                    os.replace(temporary_path, job.progress_path)
+                    break
+                except PermissionError:
+                    if attempt == 9:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
+            with job.stage_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+        except OSError:
+            LOGGER.exception("写入任务管理状态失败：%s", job.job_id)
 
 
-MANAGER = JobManager()
+MANAGER: JobManager | None = None
+
+
+def _get_manager() -> JobManager:
+    """返回当前服务实例的任务管理器。"""
+    global MANAGER
+    if MANAGER is None:
+        MANAGER = JobManager()
+    return MANAGER
 
 
 def _require_auth(request: Request) -> None:
@@ -474,17 +787,19 @@ def _read_page_count(path: Path) -> int:
     return page_count
 
 
-async def _cleanup_loop() -> None:
+async def _cleanup_loop(manager: JobManager) -> None:
     while True:
         await asyncio.sleep(CONFIG.cleanup_interval_seconds)
-        removed = MANAGER.cleanup_expired()
+        removed = manager.cleanup_expired()
         if removed:
             LOGGER.info("清理过期任务：%s", removed)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    cleanup_task = asyncio.create_task(_cleanup_loop())
+    global MANAGER
+    manager = _get_manager()
+    cleanup_task = asyncio.create_task(_cleanup_loop(manager))
     try:
         yield
     finally:
@@ -493,7 +808,9 @@ async def lifespan(_: FastAPI):
             await cleanup_task
         except asyncio.CancelledError:
             pass
-        MANAGER.close()
+        manager.close()
+        if MANAGER is manager:
+            MANAGER = None
 
 
 app = FastAPI(
@@ -519,6 +836,7 @@ if allowed_origins:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
+    manager = _get_manager()
     return {
         "status": "ok",
         "engine": CONFIG.engine,
@@ -531,7 +849,7 @@ def health() -> dict[str, Any]:
         "text_full_page_image_min_pixels": CONFIG.text_full_page_image_min_pixels,
         "text_garbled_char_ratio": CONFIG.text_garbled_char_ratio,
         "export_mode": CONFIG.export_mode,
-        "model_loaded": MANAGER.model_loaded(),
+        "model_loaded": manager.model_loaded(),
         "max_upload_bytes": CONFIG.max_upload_bytes,
         "max_pages": CONFIG.max_pages,
         "page_image_max_pixels": CONFIG.page_image_max_pixels,
@@ -542,8 +860,9 @@ def health() -> dict[str, Any]:
 
 @app.post("/api/pdf-to-word/jobs", dependencies=[Depends(_require_auth)])
 async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
-    MANAGER.cleanup_expired()
-    if not MANAGER.has_capacity():
+    manager = _get_manager()
+    manager.cleanup_expired()
+    if not manager.has_capacity():
         raise HTTPException(status_code=429, detail="任务队列已满，请稍后重试")
     staging_root = CONFIG.data_root / "staging"
     staging_root.mkdir(parents=True, exist_ok=True)
@@ -551,7 +870,7 @@ async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
     try:
         await _save_upload(file, staging_path)
         page_count = _read_page_count(staging_path)
-        job = MANAGER.create(_safe_filename(file.filename), staging_path, page_count)
+        job = manager.create(_safe_filename(file.filename), staging_path, page_count)
         return job.as_dict()
     except HTTPException:
         staging_path.unlink(missing_ok=True)
@@ -568,7 +887,7 @@ async def create_job(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.get("/api/pdf-to-word/jobs/{job_id}", dependencies=[Depends(_require_auth)])
 def get_job(job_id: str) -> dict[str, Any]:
-    job = MANAGER.get(job_id)
+    job = _get_manager().get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     return job.as_dict()
@@ -576,7 +895,7 @@ def get_job(job_id: str) -> dict[str, Any]:
 
 @app.get("/api/pdf-to-word/jobs/{job_id}/result", dependencies=[Depends(_require_auth)])
 def download_result(job_id: str) -> FileResponse:
-    job = MANAGER.get(job_id)
+    job = _get_manager().get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="任务不存在或已过期")
     if job.status != "succeeded" or not job.output_path.is_file():
@@ -591,7 +910,7 @@ def download_result(job_id: str) -> FileResponse:
 @app.delete("/api/pdf-to-word/jobs/{job_id}", dependencies=[Depends(_require_auth)])
 def cancel_job(job_id: str) -> dict[str, Any]:
     try:
-        job = MANAGER.cancel(job_id)
+        job = _get_manager().cancel(job_id)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="任务不存在或已过期") from error
     return job.as_dict()

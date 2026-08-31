@@ -49,7 +49,7 @@ $env:PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK = 'True'
 
 ## 第一版服务器服务
 
-服务文件为 `pdf_to_word_service.py`，默认先分析 PDF 文本层和页面图像：文本层完整的文字型 PDF 走快速文本路线；存在但不完整的文本层走原始页面保真路线；没有可用文本层的文件使用默认的 `structure-lite` OCR 快速路线。API 进程只管理任务状态，实际转换交给独立 worker 进程；任务状态保存在内存，任务文件保存在 `service_data\jobs`，过期任务按 TTL 清理。
+服务文件为 `pdf_to_word_service.py`，默认先分析 PDF 文本层和页面图像：文本层完整的文字型 PDF 走快速文本路线；存在但不完整的文本层走原始页面保真路线；没有可用文本层的文件使用默认的 `structure-lite` OCR 快速路线。API 进程只负责任务接入和状态查询，实际转换交给可独立终止的 worker 进程；任务状态持久化在 `service_data\jobs.sqlite3`，任务文件保存在 `service_data\jobs`，过期任务按 TTL 清理。
 
 安装服务依赖后启动：
 
@@ -60,7 +60,7 @@ $env:PDF_SERVICE_TOKEN = '请替换为随机长令牌'
 & .\.venv\Scripts\python.exe .\pdf_to_word_service.py
 ```
 
-默认仅监听 `127.0.0.1:8765`。部署到服务器时，应通过防火墙或反向代理限制访问范围；确需局域网访问时再设置 `PDF_SERVICE_HOST=0.0.0.0`，并保留 `PDF_SERVICE_TOKEN`。当前服务已经将 OCR 推理放入独立 worker，但任务状态仍保存在 API 进程内存中，正式部署前还需补充持久化队列、超时回收和反向代理安全配置。
+默认仅监听 `127.0.0.1:8765`。部署到服务器时，应通过防火墙或反向代理限制访问范围；确需局域网访问时再设置 `PDF_SERVICE_HOST=0.0.0.0`，并保留 `PDF_SERVICE_TOKEN`。当前服务已将任务状态写入 SQLite，并由独立监管线程负责 worker 调度、超时终止和失败重试；正式多实例部署前仍需接入共享 Redis/数据库队列，并完成反向代理安全配置。
 
 接口：
 
@@ -94,10 +94,13 @@ DELETE /api/pdf-to-word/jobs/{job_id}
 - `PDF_SERVICE_ALLOWED_ORIGINS`：可选，逗号分隔的 CORS 来源列表。
 - `PDF_SERVICE_TASK_TIMEOUT_SECONDS`：默认 300 秒，所有任务的软超时预算。
 - `PDF_SERVICE_OCR_TIME_BUDGET_SECONDS`：默认 60 秒，OCR 任务的快速路线软超时预算。
+- `PDF_SERVICE_MAX_RETRIES`：默认 1 次；worker 异常退出、失败或超时后自动重试，设置为 0 可关闭重试。
 
 每个任务目录包含 `progress.json` 和 `stages.jsonl`。前者保存最新状态，后者记录 worker 进程写入的阶段事件，便于定位模型加载、推理、导出和失败原因。
 
-OCR 任务会在 `stages.jsonl` 中为每个页面记录识别行数、平均和最低置信度、低置信度比例、疑似乱码比例及 `ocr_needs_review` 标志。当前超时在页面或阶段边界被检查，属于软超时；运行中 worker 的强制终止仍需由后续的 worker 监管器实现。
+任务状态同时写入 `jobs.sqlite3`。服务重启时，仍有输入文件的 `queued`/`processing` 任务会恢复为排队状态；任务达到重试上限后才进入最终失败或超时状态。
+
+OCR 任务会在 `stages.jsonl` 中为每个页面记录识别行数、平均和最低置信度、低置信度比例、疑似乱码比例及 `ocr_needs_review` 标志。当前超时首先在页面或阶段边界检查，属于软超时；监管线程还会按任务预算强制终止仍在运行的 worker，并根据重试次数决定重新排队或进入最终失败状态。
 
 ## 当前验证结论
 
