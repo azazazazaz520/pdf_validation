@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +16,8 @@ _MIN_VERTICAL_LINE_LENGTH = 10.0
 _COORDINATE_TOLERANCE = 2.5
 _MAX_TABLE_ROW_GAP = 60.0
 _MIN_TABLE_WIDTH = 60.0
+_MIN_CELL_LINE_LENGTH = 8.0
+_MIN_BOUNDARY_COVERAGE = 0.6
 
 
 @dataclass(frozen=True)
@@ -39,13 +41,29 @@ class PdfTextLine:
 
 
 @dataclass(frozen=True)
+class PdfTableCell:
+    """保存表格单元格的网格位置、跨行跨列信息和文本。"""
+
+    row_index: int
+    column_index: int
+    row_span: int
+    column_span: int
+    bbox: tuple[float, float, float, float]
+    text: str
+
+
+@dataclass(frozen=True)
 class PdfTable:
-    """保存 PDF 几何表格的边界、列边界和单元格文本。"""
+    """保存 PDF 几何表格的边界、列边界、行边界和单元格。"""
 
     bbox: tuple[float, float, float, float]
     column_boundaries: tuple[float, ...]
     row_boundaries: tuple[float, ...]
     rows: tuple[tuple[str, ...], ...]
+    cells: tuple[PdfTableCell, ...] = ()
+    header_row_count: int = 1
+    continued_from_previous_page: bool = False
+    continuation_header_rows: tuple[tuple[str, ...], ...] = ()
 
     @property
     def column_count(self) -> int:
@@ -54,6 +72,14 @@ class PdfTable:
     @property
     def row_count(self) -> int:
         return max(len(self.row_boundaries) - 1, 0)
+
+    @property
+    def row_heights(self) -> tuple[float, ...]:
+        """返回每一行在 PDF 中的高度，单位为 point。"""
+        return tuple(
+            max(self.row_boundaries[index + 1] - self.row_boundaries[index], 0.0)
+            for index in range(self.row_count)
+        )
 
 
 @dataclass(frozen=True)
@@ -86,6 +112,7 @@ class _HorizontalLine:
     top: float
     x0: float
     x1: float
+    segments: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,6 +120,17 @@ class _VerticalLine:
     x: float
     top: float
     bottom: float
+
+
+@dataclass(frozen=True)
+class _TableCandidate:
+    """保存表格候选区域及其可用于识别合并单元格的线段。"""
+
+    bbox: tuple[float, float, float, float]
+    column_boundaries: tuple[float, ...]
+    row_boundaries: tuple[float, ...]
+    horizontal_lines: tuple[_HorizontalLine, ...]
+    vertical_lines: tuple[_VerticalLine, ...]
 
 
 @dataclass
@@ -250,6 +288,7 @@ def _cluster_horizontal_lines(
             top=sum(item.top for item in cluster) / len(cluster),
             x0=min(item.x0 for item in cluster),
             x1=max(item.x1 for item in cluster),
+            segments=tuple((item.x0, item.x1) for item in cluster),
         )
         for cluster in clusters
     ]
@@ -348,13 +387,144 @@ def _table_boundary_lines(
     ]
 
 
+def _table_column_boundaries(
+    vertical: list[_VerticalLine],
+    *,
+    x0: float,
+    x1: float,
+    top: float,
+    bottom: float,
+) -> tuple[float, ...]:
+    """从候选区域内的垂直线段提取列边界，保留局部边界以支持合并单元格。"""
+    positions = [x0, x1]
+    for line in vertical:
+        if line.x < x0 - _COORDINATE_TOLERANCE or line.x > x1 + _COORDINATE_TOLERANCE:
+            continue
+        overlap = min(line.bottom, bottom) - max(line.top, top)
+        if overlap >= _MIN_CELL_LINE_LENGTH:
+            positions.append(line.x)
+
+    clusters: list[list[float]] = []
+    for position in sorted(positions):
+        if (
+            clusters
+            and position - clusters[-1][-1] <= _COORDINATE_TOLERANCE
+        ):
+            clusters[-1].append(position)
+        else:
+            clusters.append([position])
+    return tuple(sum(cluster) / len(cluster) for cluster in clusters)
+
+
+def _horizontal_coverage(
+    lines: list[_HorizontalLine],
+    *,
+    top: float,
+    x0: float,
+    x1: float,
+) -> float:
+    if x1 <= x0:
+        return 0.0
+    intervals: list[tuple[float, float]] = []
+    for line in lines:
+        if abs(line.top - top) > _COORDINATE_TOLERANCE:
+            continue
+        segments = line.segments or ((line.x0, line.x1),)
+        intervals.extend(
+            (
+                max(segment_x0, x0),
+                min(segment_x1, x1),
+            )
+            for segment_x0, segment_x1 in segments
+            if segment_x1 > x0 and segment_x0 < x1
+        )
+    merged = _merge_intervals(intervals)
+    covered = sum(max(end - start, 0.0) for start, end in merged)
+    return covered / (x1 - x0)
+
+
+def _has_vertical_boundary(
+    lines: list[_VerticalLine],
+    *,
+    x: float,
+    top: float,
+    bottom: float,
+) -> bool:
+    return _vertical_coverage(
+        [line for line in lines if abs(line.x - x) <= _COORDINATE_TOLERANCE],
+        top=top,
+        bottom=bottom,
+    ) >= _MIN_BOUNDARY_COVERAGE
+
+
+def _has_horizontal_boundary(
+    lines: list[_HorizontalLine],
+    *,
+    top: float,
+    x0: float,
+    x1: float,
+) -> bool:
+    return (
+        _horizontal_coverage(lines, top=top, x0=x0, x1=x1)
+        >= _MIN_BOUNDARY_COVERAGE
+    )
+
+
+def _extract_cell_spans(candidate: _TableCandidate) -> list[tuple[int, int, int, int]]:
+    """根据局部边界缺失情况推断表格中的跨行和跨列单元格。"""
+    column_boundaries = candidate.column_boundaries
+    row_boundaries = candidate.row_boundaries
+    row_count = max(len(row_boundaries) - 1, 0)
+    column_count = max(len(column_boundaries) - 1, 0)
+    occupied: set[tuple[int, int]] = set()
+    spans: list[tuple[int, int, int, int]] = []
+
+    for row_index in range(row_count):
+        for column_index in range(column_count):
+            if (row_index, column_index) in occupied:
+                continue
+            column_span = 1
+            while column_index + column_span < column_count:
+                divider_x = column_boundaries[column_index + column_span]
+                if _has_vertical_boundary(
+                    list(candidate.vertical_lines),
+                    x=divider_x,
+                    top=row_boundaries[row_index],
+                    bottom=row_boundaries[row_index + 1],
+                ):
+                    break
+                column_span += 1
+
+            row_span = 1
+            while row_index + row_span < row_count:
+                next_row = row_index + row_span
+                if any(
+                    (next_row, column) in occupied
+                    for column in range(column_index, column_index + column_span)
+                ):
+                    break
+                if _has_horizontal_boundary(
+                    list(candidate.horizontal_lines),
+                    top=row_boundaries[next_row],
+                    x0=column_boundaries[column_index],
+                    x1=column_boundaries[column_index + column_span],
+                ):
+                    break
+                row_span += 1
+
+            span = (row_index, column_index, row_span, column_span)
+            spans.append(span)
+            for row in range(row_index, row_index + row_span):
+                for column in range(column_index, column_index + column_span):
+                    occupied.add((row, column))
+    return spans
+
+
 def _horizontal_run_tables(
     horizontal: list[_HorizontalLine],
     vertical: list[_VerticalLine],
-) -> list[tuple[float, float, float, float, tuple[float, ...], tuple[float, ...]]]:
-    candidates: list[
-        tuple[float, float, float, float, tuple[float, ...], tuple[float, ...]]
-    ] = []
+) -> list[_TableCandidate]:
+    candidates: list[_TableCandidate] = []
     index = 0
     while index < len(horizontal):
         run = [horizontal[index]]
@@ -393,36 +563,25 @@ def _horizontal_run_tables(
         if x1 - x0 < _MIN_TABLE_WIDTH:
             continue
 
-        boundary_lines = _table_boundary_lines(
+        column_boundaries = _table_column_boundaries(
             vertical,
             x0=x0,
             x1=x1,
             top=table_top,
             bottom=table_bottom,
         )
-        boundary_lines.sort(key=lambda line: line.x)
-        column_boundaries: list[float] = []
-        for line in boundary_lines:
-            if (
-                not column_boundaries
-                or abs(column_boundaries[-1] - line.x) > _COORDINATE_TOLERANCE
-            ):
-                column_boundaries.append(line.x)
         if len(column_boundaries) < 2:
             continue
-        if column_boundaries[0] > x0 + 4.0:
-            x0 = column_boundaries[0]
-        if column_boundaries[-1] < x1 - 4.0:
-            x1 = column_boundaries[-1]
+        x0 = column_boundaries[0]
+        x1 = column_boundaries[-1]
         row_boundaries = tuple(item.top for item in run)
         candidates.append(
-            (
-                x0,
-                table_top,
-                x1,
-                table_bottom,
-                tuple(column_boundaries),
-                row_boundaries,
+            _TableCandidate(
+                bbox=(x0, table_top, x1, table_bottom),
+                column_boundaries=column_boundaries,
+                row_boundaries=row_boundaries,
+                horizontal_lines=tuple(run),
+                vertical_lines=tuple(vertical),
             )
         )
     return candidates
@@ -438,57 +597,72 @@ def _line_is_in_table(line: PdfTextLine, bbox: tuple[float, float, float, float]
 
 def _extract_table(
     lines: list[PdfTextLine],
-    candidate: tuple[
-        float,
-        float,
-        float,
-        float,
-        tuple[float, ...],
-        tuple[float, ...],
-    ],
+    candidate: _TableCandidate,
 ) -> PdfTable:
-    x0, top, x1, bottom, column_boundaries, row_boundaries = candidate
-    cell_lines: dict[tuple[int, int], list[PdfTextLine]] = {}
-    bbox = (x0, top, x1, bottom)
+    x0, top, x1, bottom = candidate.bbox
+    column_boundaries = candidate.column_boundaries
+    row_boundaries = candidate.row_boundaries
+    cell_spans = _extract_cell_spans(candidate)
+    cell_lines: dict[tuple[int, int], list[PdfTextLine]] = {
+        (row_index, column_index): []
+        for row_index, column_index, _, _ in cell_spans
+    }
     for line in lines:
-        if not _line_is_in_table(line, bbox):
+        if not _line_is_in_table(line, candidate.bbox):
             continue
-        row_index = next(
-            (
-                index
-                for index in range(len(row_boundaries) - 1)
-                if row_boundaries[index] <= line.center_y <= row_boundaries[index + 1]
-            ),
-            None,
-        )
-        column_index = next(
-            (
-                index
-                for index in range(len(column_boundaries) - 1)
-                if column_boundaries[index] <= line.center_x <= column_boundaries[index + 1]
-            ),
-            None,
-        )
-        if row_index is None or column_index is None:
+        matching_cells: list[tuple[float, tuple[int, int]]] = []
+        for row_index, column_index, row_span, column_span in cell_spans:
+            cell_top = row_boundaries[row_index]
+            cell_bottom = row_boundaries[row_index + row_span]
+            cell_x0 = column_boundaries[column_index]
+            cell_x1 = column_boundaries[column_index + column_span]
+            overlap_x = min(line.x1, cell_x1) - max(line.x0, cell_x0)
+            if overlap_x <= 0 and not cell_x0 <= line.center_x <= cell_x1:
+                continue
+            if not cell_top <= line.center_y <= cell_bottom:
+                continue
+            overlap_y = min(line.bottom, cell_bottom) - max(line.top, cell_top)
+            score = max(overlap_x, 0.1) * max(overlap_y, 0.1)
+            matching_cells.append((score, (row_index, column_index)))
+        if not matching_cells:
             continue
-        cell_lines.setdefault((row_index, column_index), []).append(line)
+        _, cell_key = max(matching_cells, key=lambda item: item[0])
+        cell_lines[cell_key].append(line)
 
-    rows: list[tuple[str, ...]] = []
-    for row_index in range(len(row_boundaries) - 1):
-        row: list[str] = []
-        for column_index in range(len(column_boundaries) - 1):
-            values = sorted(
-                cell_lines.get((row_index, column_index), []),
-                key=lambda line: (line.top, line.x0),
+    rows = [
+        ["" for _ in range(max(len(column_boundaries) - 1, 0))]
+        for _ in range(max(len(row_boundaries) - 1, 0))
+    ]
+    cells: list[PdfTableCell] = []
+    for row_index, column_index, row_span, column_span in cell_spans:
+        values = sorted(
+            cell_lines[(row_index, column_index)],
+            key=lambda line: (line.top, line.x0),
+        )
+        text = "\n".join(line.text for line in values).strip()
+        rows[row_index][column_index] = text
+        cells.append(
+            PdfTableCell(
+                row_index=row_index,
+                column_index=column_index,
+                row_span=row_span,
+                column_span=column_span,
+                bbox=(
+                    column_boundaries[column_index],
+                    row_boundaries[row_index],
+                    column_boundaries[column_index + column_span],
+                    row_boundaries[row_index + row_span],
+                ),
+                text=text,
             )
-            row.append("\n".join(line.text for line in values).strip())
-        rows.append(tuple(row))
+        )
 
     return PdfTable(
-        bbox=bbox,
+        bbox=candidate.bbox,
         column_boundaries=column_boundaries,
         row_boundaries=row_boundaries,
-        rows=tuple(rows),
+        rows=tuple(tuple(row) for row in rows),
+        cells=tuple(cells),
     )
 
 
@@ -508,6 +682,89 @@ def _find_tables(
         for table in tables
         if any(value for row in table.rows for value in row)
     )
+
+
+def _column_width_ratios(table: PdfTable) -> tuple[float, ...]:
+    widths = [
+        table.column_boundaries[index + 1] - table.column_boundaries[index]
+        for index in range(table.column_count)
+    ]
+    total = sum(widths)
+    if total <= 0:
+        return ()
+    return tuple(width / total for width in widths)
+
+
+def _tables_can_continue(
+    previous_page: PdfPageLayout,
+    previous_table: PdfTable,
+    current_page: PdfPageLayout,
+    current_table: PdfTable,
+) -> bool:
+    """判断相邻页面的表格是否具有续表的几何特征。"""
+    if previous_table.column_count != current_table.column_count:
+        return False
+    if not previous_table.rows or not current_table.rows:
+        return False
+    if previous_table.bbox[3] < previous_page.height * 0.7:
+        return False
+    if current_table.bbox[1] > current_page.height * 0.3:
+        return False
+    previous_x0, _, previous_x1, _ = previous_table.bbox
+    current_x0, _, current_x1, _ = current_table.bbox
+    previous_width = max(previous_x1 - previous_x0, 1.0)
+    current_width = max(current_x1 - current_x0, 1.0)
+    if abs(previous_x0 / previous_page.width - current_x0 / current_page.width) > 0.04:
+        return False
+    if abs(previous_x1 / previous_page.width - current_x1 / current_page.width) > 0.04:
+        return False
+    if abs(previous_width / previous_page.width - current_width / current_page.width) > 0.04:
+        return False
+    previous_ratios = _column_width_ratios(previous_table)
+    current_ratios = _column_width_ratios(current_table)
+    return bool(
+        previous_ratios
+        and len(previous_ratios) == len(current_ratios)
+        and max(
+            abs(previous - current)
+            for previous, current in zip(previous_ratios, current_ratios)
+        )
+        <= 0.06
+    )
+
+
+def _mark_table_continuations(
+    pages: tuple[PdfPageLayout, ...],
+) -> tuple[PdfPageLayout, ...]:
+    """为相邻页面的续表补充表头元数据。"""
+    updated_pages = list(pages)
+    for page_index in range(1, len(updated_pages)):
+        previous_page = updated_pages[page_index - 1]
+        current_page = updated_pages[page_index]
+        if not previous_page.tables or not current_page.tables:
+            continue
+        previous_table = previous_page.tables[-1]
+        current_table = current_page.tables[0]
+        if not _tables_can_continue(
+            previous_page,
+            previous_table,
+            current_page,
+            current_table,
+        ):
+            continue
+        header = (previous_table.rows[0],)
+        current_header_is_present = current_table.rows[0] == previous_table.rows[0]
+        updated_table = replace(
+            current_table,
+            continued_from_previous_page=True,
+            header_row_count=1 if current_header_is_present else 0,
+            continuation_header_rows=() if current_header_is_present else header,
+        )
+        updated_pages[page_index] = replace(
+            current_page,
+            tables=(updated_table, *current_page.tables[1:]),
+        )
+    return tuple(updated_pages)
 
 
 def extract_pdf_layout(source_pdf: Path) -> PdfDocumentLayout:
@@ -537,4 +794,4 @@ def extract_pdf_layout(source_pdf: Path) -> PdfDocumentLayout:
             )
     finally:
         document.close()
-    return PdfDocumentLayout(pages=tuple(pages))
+    return PdfDocumentLayout(pages=_mark_table_continuations(tuple(pages)))

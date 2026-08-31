@@ -9,7 +9,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from docx import Document
-from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_ROW_HEIGHT_RULE
 from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
@@ -323,6 +323,34 @@ def _set_table_row_properties(row: Any, *, repeat_header: bool) -> None:
         row_properties.append(table_header)
 
 
+def _set_fixed_table_layout(table: Any) -> None:
+    """将 Word 表格设置为固定布局，避免自动调整破坏 PDF 列宽比例。"""
+    table_properties = table._tbl.tblPr
+    layout = table_properties.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        table_properties.append(layout)
+    layout.set(qn("w:type"), "fixed")
+
+
+def _set_pdf_cell_content(
+    cell: Any,
+    text: str,
+    *,
+    width: float,
+    is_header: bool,
+) -> None:
+    """设置 PDF 表格单元格的宽度、对齐方式和文本格式。"""
+    cell.width = Inches(width)
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+    cell.text = text
+    for paragraph in cell.paragraphs:
+        paragraph.paragraph_format.space_after = Pt(0)
+        if is_header:
+            for run in paragraph.runs:
+                run.bold = True
+
+
 def _add_pdf_table(
     document: Document,
     pdf_table: PdfTable,
@@ -332,6 +360,7 @@ def _add_pdf_table(
     table = document.add_table(rows=0, cols=pdf_table.column_count)
     table.style = "Table Grid"
     table.autofit = False
+    _set_fixed_table_layout(table)
     widths = [
         max(
             (
@@ -352,18 +381,70 @@ def _add_pdf_table(
     )
     scale = min(1.0, available_width / max(sum(widths), 0.2))
     widths = [width * scale for width in widths]
-    for row_index, values in enumerate(pdf_table.rows):
+    continuation_header_rows = list(pdf_table.continuation_header_rows)
+    source_rows = list(pdf_table.rows)
+    row_offset = len(continuation_header_rows)
+    all_rows = continuation_header_rows + source_rows
+    header_row_count = row_offset + pdf_table.header_row_count
+    row_heights = pdf_table.row_heights
+    default_header_height = row_heights[0] if row_heights else 18.0
+    all_row_heights = [
+        *([default_header_height] * row_offset),
+        *row_heights,
+    ]
+    for row_index in range(len(all_rows)):
         row = table.add_row()
-        _set_table_row_properties(row, repeat_header=row_index == 0)
+        _set_table_row_properties(
+            row,
+            repeat_header=row_index < header_row_count,
+        )
+        if row_index < len(all_row_heights):
+            row.height = Pt(max(all_row_heights[row_index] * scale, 6.0))
+            row.height_rule = WD_ROW_HEIGHT_RULE.AT_LEAST
         for column_index, cell in enumerate(row.cells):
             cell.width = Inches(widths[column_index])
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            cell.text = values[column_index] if column_index < len(values) else ""
-            for paragraph in cell.paragraphs:
-                paragraph.paragraph_format.space_after = Pt(0)
-                if row_index == 0:
-                    for run in paragraph.runs:
-                        run.bold = True
+
+    for row_index, values in enumerate(continuation_header_rows):
+        for column_index, cell in enumerate(table.rows[row_index].cells):
+            _set_pdf_cell_content(
+                cell,
+                values[column_index] if column_index < len(values) else "",
+                width=widths[column_index],
+                is_header=True,
+            )
+
+    if pdf_table.cells:
+        for pdf_cell in pdf_table.cells:
+            source_row_index = pdf_cell.row_index + row_offset
+            cell = table.cell(source_row_index, pdf_cell.column_index)
+            if pdf_cell.row_span > 1 or pdf_cell.column_span > 1:
+                cell = cell.merge(
+                    table.cell(
+                        source_row_index + pdf_cell.row_span - 1,
+                        pdf_cell.column_index + pdf_cell.column_span - 1,
+                    )
+                )
+            _set_pdf_cell_content(
+                cell,
+                pdf_cell.text,
+                width=sum(
+                    widths[
+                        pdf_cell.column_index : pdf_cell.column_index
+                        + pdf_cell.column_span
+                    ]
+                ),
+                is_header=pdf_cell.row_index < pdf_table.header_row_count,
+            )
+    else:
+        for row_index, values in enumerate(all_rows):
+            for column_index, cell in enumerate(table.rows[row_index].cells):
+                _set_pdf_cell_content(
+                    cell,
+                    values[column_index] if column_index < len(values) else "",
+                    width=widths[column_index],
+                    is_header=row_index < header_row_count,
+                )
     for column_index, column in enumerate(table.columns):
         column.width = Inches(widths[column_index])
 

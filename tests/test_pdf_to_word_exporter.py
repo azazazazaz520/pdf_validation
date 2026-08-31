@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from docx import Document
+from docx.oxml.ns import qn
 from PIL import Image
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
@@ -81,6 +82,124 @@ class HybridExportTest(unittest.TestCase):
             )
             self.assertEqual(len(document.tables), 1)
             self.assertEqual(document.tables[0].cell(2, 1).text, "B")
+
+    def test_layout_export_preserves_merged_cells_and_row_heights(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "merged-table.pdf"
+            docx_path = root / "merged-table.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(360, 300))
+            horizontal_lines = (
+                (36, 220, 284),
+                (36, 180, 284),
+                (36, 140, 160),
+                (36, 100, 284),
+                (36, 60, 284),
+            )
+            for x0, y, x1 in horizontal_lines:
+                canvas.line(x0, y, x1, y)
+            canvas.line(36, 60, 36, 220)
+            canvas.line(160, 60, 160, 180)
+            canvas.line(284, 60, 284, 220)
+            canvas.setFont("Helvetica", 10)
+            canvas.drawString(45, 200, "Merged header")
+            canvas.drawString(45, 160, "Group")
+            canvas.drawString(170, 160, "Shared value")
+            canvas.drawString(45, 120, "A")
+            canvas.drawString(45, 80, "B")
+            canvas.drawString(170, 80, "Final value")
+            canvas.save()
+
+            layout = extract_pdf_layout(pdf_path)
+            pdf_table = layout.pages[0].tables[0]
+            cells = {
+                (cell.row_index, cell.column_index): cell
+                for cell in pdf_table.cells
+            }
+            self.assertEqual(pdf_table.row_count, 4)
+            self.assertEqual(pdf_table.column_count, 2)
+            self.assertEqual(pdf_table.row_heights, (40.0, 40.0, 40.0, 40.0))
+            self.assertEqual(cells[(0, 0)].column_span, 2)
+            self.assertEqual(cells[(1, 1)].row_span, 2)
+            self.assertEqual(cells[(0, 0)].text, "Merged header")
+            self.assertEqual(cells[(1, 1)].text, "Shared value")
+
+            export_text_pages_to_docx(
+                ["ignored"],
+                docx_path,
+                title="merged-table-test",
+                source_pdf=pdf_path,
+            )
+
+            table = Document(str(docx_path)).tables[0]
+            self.assertFalse(table.autofit)
+            self.assertGreater(table.rows[0].height.pt, 0)
+            self.assertEqual(
+                table._tbl.tblPr.find(qn("w:tblLayout")).get(qn("w:type")),
+                "fixed",
+            )
+            self.assertIsNotNone(table.rows[0]._tr.trPr.find(qn("w:tblHeader")))
+            self.assertIsNotNone(table.rows[0]._tr.trPr.find(qn("w:cantSplit")))
+            self.assertIs(table.cell(0, 0)._tc, table.cell(0, 1)._tc)
+            self.assertIs(table.cell(1, 1)._tc, table.cell(2, 1)._tc)
+            self.assertEqual(table.cell(0, 0).text, "Merged header")
+            self.assertEqual(table.cell(1, 1).text, "Shared value")
+
+    def test_layout_export_repeats_header_for_cross_page_table(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            pdf_path = root / "continued-table.pdf"
+            docx_path = root / "continued-table.docx"
+
+            canvas = Canvas(str(pdf_path), pagesize=(360, 300))
+            for y in (280, 240, 200, 160, 120, 80, 20):
+                canvas.line(36, y, 284, y)
+            for x in (36, 160, 284):
+                canvas.line(x, 20, x, 280)
+            canvas.setFont("Helvetica", 10)
+            for x, text in ((45, "Name"), (170, "Value")):
+                canvas.drawString(x, 260, text)
+            for y, name, value in (
+                (220, "Alpha", "A"),
+                (180, "Beta", "B"),
+                (140, "Delta", "D"),
+                (100, "Epsilon", "E"),
+                (60, "Zeta", "Z"),
+            ):
+                canvas.drawString(45, y, name)
+                canvas.drawString(170, y, value)
+            canvas.showPage()
+
+            for y in (280, 240, 200):
+                canvas.line(36, y, 284, y)
+            for x in (36, 160, 284):
+                canvas.line(x, 200, x, 280)
+            for y, name, value in ((260, "Gamma", "C"), (220, "Eta", "G")):
+                canvas.drawString(45, y, name)
+                canvas.drawString(170, y, value)
+            canvas.save()
+
+            layout = extract_pdf_layout(pdf_path)
+            self.assertEqual(layout.table_count, 2)
+            continuation = layout.pages[1].tables[0]
+            self.assertTrue(continuation.continued_from_previous_page)
+            self.assertEqual(continuation.continuation_header_rows, (("Name", "Value"),))
+
+            export_text_pages_to_docx(
+                ["ignored", "ignored"],
+                docx_path,
+                title="continued-table-test",
+                source_pdf=pdf_path,
+            )
+
+            document = Document(str(docx_path))
+            self.assertEqual(len(document.tables), 2)
+            continued_table = document.tables[1]
+            self.assertEqual(continued_table.cell(0, 0).text, "Name")
+            self.assertEqual(continued_table.cell(0, 1).text, "Value")
+            self.assertEqual(continued_table.cell(1, 0).text, "Gamma")
+            self.assertEqual(continued_table.cell(2, 1).text, "G")
 
     def test_text_grouping_joins_wrapped_lines_without_extra_spaces(self) -> None:
         blocks = _group_text_lines(
